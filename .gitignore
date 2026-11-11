@@ -1,0 +1,12 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# .NET build and IDE output
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+*.suo
+TestResults/
