@@ -41,7 +41,7 @@ SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" /opt/mssql-tools18/bin/sqlcmd -S localhost -
 exit
 ```
 
-Expect SQL Server to return `1`, Kafka to report a leader on the single-node quorum, and the API to return HTTP `404` because the skeleton has no routes. For a Kafka exercise, use the same internal bootstrap address with `kafka-topics.sh --list` to check the broker's topic metadata.
+Expect SQL Server to return `1`, Kafka to report a leader on the single-node quorum, and the API to return HTTP `404` for the unmapped root path. Use the same internal bootstrap address with `kafka-topics.sh --list` to check the broker's topic metadata.
 
 Stop and remove the containers with `docker compose down`. The named data volumes persist across `down` and subsequent `up` runs.
 
@@ -71,22 +71,26 @@ docker compose run --build --rm migrations 0
 docker compose run --build --rm migrations
 ```
 
-## Week 1 / Lab 3 — HTTP API
+## Week 1 / Lab 4 — HTTP API and Kafka producer
 
-For local SQL-only testing, set `LAB3_SQL_ONLY_POST=true` in `.env`, apply the migration, and start the API. A successful test POST returns `200 OK`, a `Location` header, and `X-Lab-Mode: sql-only`. It saves a `Pending` row and returns its fields. With the flag off, a valid POST returns `503` before writing because command publication is unavailable. GET uses MSSQL in either mode.
+The API inserts a `Pending` row and publishes a command to `robot.commands` through `kafka:29092`. The producer uses `acks=all` and a five-second delivery timeout. A confirmed delivery returns `201 Created` with `Location`. The broker can create the topic on first publication. Use the idempotent create command below to provision it explicitly before testing.
 
 ```powershell
 docker compose run --build --rm migrations
-docker compose up --build --wait api mssql
+docker compose up --build --wait api mssql kafka
+docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic robot.commands --partitions 1 --replication-factor 1
 $body = @{ content = 'Hello ROS 2' } | ConvertTo-Json
 $message = Invoke-RestMethod http://127.0.0.1:8080/api/messages -Method Post -ContentType application/json -Body $body
 Invoke-RestMethod "http://127.0.0.1:8080/api/messages/$($message.messageId)"
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:29092 --topic robot.commands --from-beginning --timeout-ms 10000 --property print.key=true
 ```
 
-Lab 4 will remove the SQL-only flag and response. After the insert, the API will publish the command to `robot.commands` using the saved `messageId`. A successful broker acknowledgement will enable the contract's `201 Created` response with `Location`. If publication fails or its outcome is unknown, the persisted row may remain `Pending` and the API returns an error.
+Compare the returned `messageId` with the Kafka key and the JSON `messageId`. The consumer prints the topic history and exits after its idle timeout. A broker acknowledgement confirms Kafka delivery. Simulator receipt requires the later return flow.
 
-Run the automated HTTP and MSSQL checks from the repository root with PowerShell 7.5 or later. Keep host ports `8080` and `1433` free. The script uses a disposable Compose project and database volume, tests a real SQL Server outage, and removes its test resources afterward.
+SQL Server and Kafka writes are separate. If the SQL insert succeeds and Kafka delivery cannot be confirmed, POST returns `503` and the row stays `Pending`. Kafka may already contain the command if its acknowledgement was lost. A repeated POST creates a new command and UUID.
+
+Run the HTTP, SQL Server, and Kafka checks from the repository root with PowerShell 7.5 or later. The script uses a disposable Compose project with an automatically assigned API port and saves credential-free evidence under `TestResults` before removing its test resources.
 
 ```powershell
-pwsh -NoProfile -File ./tests/lab3-http.ps1
+pwsh -NoProfile -File ./tests/lab4-http.ps1
 ```

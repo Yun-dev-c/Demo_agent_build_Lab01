@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Confluent.Kafka;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Net.Http.Headers;
@@ -8,8 +9,12 @@ namespace RoboticsFleet.Api.Messages;
 
 internal static class MessageEndpoints
 {
+    private const string CommandTopic = "robot.commands";
+    private static readonly JsonSerializerOptions CommandJson = new(JsonSerializerDefaults.Web);
+
     internal static async Task<IResult> CreateAsync(
-        HttpContext context, RoboticsFleetDbContext db, IConfiguration configuration, CancellationToken cancellationToken)
+        HttpContext context, RoboticsFleetDbContext db, IProducer<string, string> producer,
+        ILoggerFactory loggerFactory, CancellationToken cancellationToken)
     {
         var request = context.Request;
         if (context.Features.Get<IHttpRequestBodyDetectionFeature>()?.CanHaveBody == false)
@@ -42,21 +47,39 @@ internal static class MessageEndpoints
             return Results.BadRequest();
         }
 
-        if (!configuration.GetValue<bool>("Lab3:SqlOnlyPost"))
-        {
-            return Results.Problem(
-                statusCode: StatusCodes.Status503ServiceUnavailable,
-                detail: "Command publication is unavailable.");
-        }
-
         var message = new Message { Content = input.Content, CreatedAt = DateTimeOffset.UtcNow };
         db.Messages.Add(message);
         await db.SaveChangesAsync(cancellationToken);
 
-        // Lab 4 will publish this persisted message and return 201 after Kafka acknowledges it.
-        context.Response.Headers.Location = $"/api/messages/{message.MessageId:D}";
-        context.Response.Headers["X-Lab-Mode"] = "sql-only";
-        return Results.Ok(MessageResponse.From(message));
+        var key = message.MessageId.ToString("D");
+        var command = new RobotCommand(key, "PING", message.Content, message.CreatedAt.UtcDateTime);
+        var logger = loggerFactory.CreateLogger(typeof(MessageEndpoints));
+        try
+        {
+            // The SQL write is committed. Wait for the bounded delivery result even if the client disconnects.
+            var delivery = await producer.ProduceAsync(CommandTopic, new Message<string, string>
+            {
+                Key = key,
+                Value = JsonSerializer.Serialize(command, CommandJson)
+            });
+
+            if (delivery.Status == PersistenceStatus.Persisted)
+            {
+                return Results.Created($"/api/messages/{key}", MessageResponse.From(message));
+            }
+
+            logger.LogWarning("Kafka delivery for {MessageId} on {Topic} was {DeliveryStatus} after the SQL insert",
+                key, CommandTopic, delivery.Status);
+        }
+        catch (KafkaException exception)
+        {
+            logger.LogWarning(exception, "Kafka publication for {MessageId} on {Topic} failed after the SQL insert with {KafkaErrorCode}",
+                key, CommandTopic, exception.Error.Code);
+        }
+
+        return Results.Problem(
+            statusCode: StatusCodes.Status503ServiceUnavailable,
+            detail: "Command publication could not be confirmed.");
     }
 
     internal static async Task<IResult> GetAsync(
@@ -74,6 +97,8 @@ internal static class MessageEndpoints
     }
 
     private sealed record CreateMessageRequest(string? Content);
+
+    private sealed record RobotCommand(string MessageId, string Type, string Content, DateTime CreatedAt);
 
     private sealed record MessageResponse(
         Guid MessageId, string Content, string Status, DateTime CreatedAt, DateTime? ReceivedAt)

@@ -10,7 +10,7 @@ services:
     environment:
       <<: *database-environment
       ASPNETCORE_HTTP_PORTS: "8080"
-      Lab3__SqlOnlyPost: "${LAB3_SQL_ONLY_POST:-false}"
+      Kafka__BootstrapServers: kafka:29092
     ports:
       - "127.0.0.1:8080:8080"
 
@@ -53,6 +53,7 @@ services:
       KAFKA_LISTENERS: INTERNAL://:29092,HOST://:9092,CONTROLLER://:9093
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,HOST://127.0.0.1:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"

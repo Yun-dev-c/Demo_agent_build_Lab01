@@ -1,3 +1,4 @@
+using Confluent.Kafka;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using RoboticsFleet.Api.Data;
@@ -17,6 +18,17 @@ if (!string.IsNullOrEmpty(sqlPassword))
 
 builder.Services.AddDbContext<RoboticsFleetDbContext>(options =>
     options.UseSqlServer(connectionString.ConnectionString));
+builder.Services.AddSingleton<IProducer<string, string>>(services =>
+{
+    var configuration = services.GetRequiredService<IConfiguration>();
+    return new ProducerBuilder<string, string>(new ProducerConfig
+    {
+        BootstrapServers = configuration["Kafka:BootstrapServers"] ?? "127.0.0.1:9092",
+        Acks = Acks.All,
+        MessageTimeoutMs = 5000,
+        AllowAutoCreateTopics = true
+    }).Build();
+});
 builder.Services.AddProblemDetails();
 
 var app = builder.Build();

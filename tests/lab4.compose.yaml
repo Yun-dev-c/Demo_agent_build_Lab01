@@ -1,0 +1,9 @@
+services:
+  api:
+    ports: !override
+      - target: 8080
+        host_ip: 127.0.0.1
+  mssql:
+    ports: !reset []
+  kafka:
+    ports: !reset []
