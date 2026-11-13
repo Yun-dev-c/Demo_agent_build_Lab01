@@ -94,3 +94,34 @@ Run the HTTP, SQL Server, and Kafka checks from the repository root with PowerSh
 ```powershell
 pwsh -NoProfile -File ./tests/lab4-http.ps1
 ```
+
+## Week 2 / Lab 6 — Kafka to ROS 2
+
+The Bridge image uses the public `ros:jazzy-ros-base-noble` image with Python 3.12. Start the local stack and apply the existing migration.
+
+```powershell
+docker compose up --build --wait api mssql kafka
+docker compose run --build --rm migrations
+docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic robot.commands --partitions 1 --replication-factor 1
+docker compose up --build --wait bridge
+```
+
+In a second terminal, start the ROS 2 subscriber and leave it running. The CLI inherits the Bridge container's ROS environment and network.
+
+```powershell
+docker compose exec bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic echo --full-length /demo/commands example_interfaces/msg/String'
+```
+
+Verify the publisher and subscriber appear before sending the command. Volatile durability means a late subscriber can miss earlier commands.
+
+```powershell
+docker compose exec bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic info /demo/commands --verbose'
+$body = @{ content = 'Lab 6 acceptance' } | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:8080/api/messages -Method Post -ContentType application/json -Body $body
+docker compose logs --tail 20 bridge
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:29092 --describe --group robotics-fleet-bridge
+```
+
+Match the HTTP `messageId` to the JSON in the subscriber's `data` and the Bridge log. The publisher uses Reliable, Volatile, Keep Last, and depth 10. The group's committed offset should be at least the logged record offset plus one. The commit records the local `publish()` handoff. Subscriber output provides separate evidence of receipt. A publish or commit error stops the Bridge so a later offset cannot skip the failed command. A publish followed by an unconfirmed commit can lead to duplicate delivery on restart.
+
+Stop the subscriber with Ctrl+C and stop the Bridge with `docker compose stop bridge`.

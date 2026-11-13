@@ -1,0 +1,19 @@
+FROM ros:jazzy-ros-base-noble
+
+SHELL ["/bin/bash", "-c"]
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       python3-venv ros-jazzy-example-interfaces \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN python3.12 -m venv --system-site-packages /opt/bridge-venv
+
+RUN /opt/bridge-venv/bin/pip install --no-cache-dir \
+    "confluent-kafka==2.6.1"
+
+COPY consumer.py /app/consumer.py
+
+CMD ["bash", "-lc", "source /opt/ros/jazzy/setup.bash && exec /opt/bridge-venv/bin/python /app/consumer.py"]
