@@ -1,13 +1,22 @@
-FROM ros:jazzy-ros-base-noble
+FROM ros:jazzy-ros-base-noble AS ros-base
 
 SHELL ["/bin/bash", "-c"]
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       python3-venv ros-jazzy-example-interfaces \
+       ros-jazzy-example-interfaces \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+FROM ros-base AS simulator
+COPY simulator.py /app/simulator.py
+CMD ["python3.12", "/app/simulator.py"]
+
+FROM ros-base AS bridge
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-venv \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN python3.12 -m venv --system-site-packages /opt/bridge-venv
 

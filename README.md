@@ -125,3 +125,35 @@ docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-se
 Match the HTTP `messageId` to the JSON in the subscriber's `data` and the Bridge log. The publisher uses Reliable, Volatile, Keep Last, and depth 10. The group's committed offset should be at least the logged record offset plus one. The commit records the local `publish()` handoff. Subscriber output provides separate evidence of receipt. A publish or commit error stops the Bridge so a later offset cannot skip the failed command. A publish followed by an unconfirmed commit can lead to duplicate delivery on restart.
 
 Stop the subscriber with Ctrl+C and stop the Bridge with `docker compose stop bridge`.
+
+## Week 2 / Lab 7 — Simulator receipt
+
+With the local environment configured, start the existing services and provision the two topics before starting the Bridge and simulator.
+
+```powershell
+docker compose up --build --wait api mssql kafka
+docker compose run --build --rm migrations
+foreach ($topic in @('robot.commands', 'robot.events')) {
+    docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic $topic --partitions 1 --replication-factor 1
+}
+docker compose --profile lab7 up --build --wait bridge simulator
+docker compose exec bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic info /demo/commands --verbose && ros2 topic info /demo/receipts --verbose'
+```
+
+Wait until both topics show a publisher and a subscriber. To observe the receipt directly, start the following command in a separate terminal before posting.
+
+```powershell
+docker compose exec bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic echo --full-length /demo/receipts example_interfaces/msg/String'
+```
+
+```powershell
+$body = @{ content = 'Lab 7 receipt verification' } | ConvertTo-Json
+$message = Invoke-RestMethod http://127.0.0.1:8080/api/messages -Method Post -ContentType application/json -Body $body
+$message
+docker compose logs --tail 20 bridge simulator
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:29092 --topic robot.events --from-beginning --timeout-ms 10000 --property print.key=true
+```
+
+Match the HTTP `messageId` to the simulator receipt, the Kafka key and JSON value, and the Bridge delivery log. The event uses `RECEIVED`, source `ros2-simulator`, and the simulator's UTC `receivedAt`. SQL status stays `Pending` until the Lab 8 consumer persists a receipt.
+
+Malformed ROS input is logged and ignored. The Bridge logs enqueue and delivery failures with the message ID. An expired receipt can be lost during a broker outage, and an uncertain acknowledgement can leave its Kafka outcome unknown. The command offset still records the earlier ROS publish handoff.

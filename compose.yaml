@@ -6,15 +6,26 @@ x-database-environment: &database-environment
 
 services:
   bridge:
-    profiles: [lab6]
+    profiles: [lab6, lab7]
     build:
       context: ./src/RoboticsFleet.Bridge
       dockerfile: dockerfile
+      target: bridge
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      ROS_AUTOMATIC_DISCOVERY_RANGE: SUBNET
     depends_on:
       kafka:
         condition: service_healthy
+
+  simulator:
+    profiles: [lab7]
+    build:
+      context: ./src/RoboticsFleet.Bridge
+      dockerfile: dockerfile
+      target: simulator
+    environment:
+      ROS_AUTOMATIC_DISCOVERY_RANGE: SUBNET
 
   api:
     build: ./src/RoboticsFleet.Api

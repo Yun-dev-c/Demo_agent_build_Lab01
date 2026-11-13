@@ -4,7 +4,7 @@ import os
 import signal
 
 import rclpy
-from confluent_kafka import Consumer, KafkaException
+from confluent_kafka import Consumer, KafkaException, Producer
 from example_interfaces.msg import String
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
@@ -29,6 +29,32 @@ def forward_command(consumer, publisher, message):
     )
 
 
+def forward_receipt(producer, message):
+    try:
+        receipt = json.loads(message.data)
+        if not isinstance(receipt, dict) or receipt.get("type") != "RECEIVED":
+            raise ValueError("Expected a RECEIVED event")
+        message_id = receipt["messageId"]
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError("Expected a messageId")
+    except (ValueError, KeyError) as error:
+        logger.warning("Ignored invalid ROS receipt: %s", error)
+        return
+
+    def report_delivery(error, record):
+        if error is not None:
+            logger.error("Kafka receipt delivery failed messageId=%s: %s", message_id, error)
+        else:
+            logger.info("Published robot.events messageId=%s partition=%s offset=%s",
+                        message_id, record.partition(), record.offset())
+
+    try:
+        producer.produce("robot.events", key=message_id, value=message.data,
+                         on_delivery=report_delivery)
+    except (KafkaException, BufferError):
+        logger.exception("Could not enqueue Kafka receipt messageId=%s", message_id)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     stopping = False
@@ -42,18 +68,29 @@ def main():
     signal.signal(signal.SIGTERM, request_stop)
 
     consumer = None
+    producer = None
     node = None
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     try:
         node = rclpy.create_node("robotics_fleet_bridge")
-        publisher = node.create_publisher(String, "/demo/commands", QoSProfile(
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
-        ))
+        )
+        publisher = node.create_publisher(String, "/demo/commands", qos)
+        bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
+        producer = Producer({
+            "bootstrap.servers": bootstrap_servers,
+            "acks": "all",
+            "message.timeout.ms": 5000,
+        })
+        node.create_subscription(
+            String, "/demo/receipts", lambda message: forward_receipt(producer, message), qos,
+        )
         consumer = Consumer({
-            "bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092"),
+            "bootstrap.servers": bootstrap_servers,
             "group.id": "robotics-fleet-bridge",
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
@@ -63,7 +100,9 @@ def main():
         logger.info("Forwarding robot.commands to /demo/commands")
 
         while not stopping:
-            message = consumer.poll(1.0)
+            rclpy.spin_once(node, timeout_sec=0)
+            producer.poll(0)
+            message = consumer.poll(0.1)
             if stopping or message is None:
                 continue
             if message.error():
@@ -85,9 +124,13 @@ def main():
             if consumer is not None:
                 consumer.close()
         finally:
-            if node is not None:
-                node.destroy_node()
-            rclpy.try_shutdown()
+            try:
+                if producer is not None and (remaining := producer.flush(5)):
+                    logger.error("Bridge stopped with %s unconfirmed Kafka receipts", remaining)
+            finally:
+                if node is not None:
+                    node.destroy_node()
+                rclpy.try_shutdown()
 
     logger.info("Bridge stopped")
     return 0
