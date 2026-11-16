@@ -157,3 +157,41 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstra
 Match the HTTP `messageId` to the simulator receipt, the Kafka key and JSON value, and the Bridge delivery log. The event uses `RECEIVED`, source `ros2-simulator`, and the simulator's UTC `receivedAt`. SQL status stays `Pending` until the Lab 8 consumer persists a receipt.
 
 Malformed ROS input is logged and ignored. The Bridge logs enqueue and delivery failures with the message ID. An expired receipt can be lost during a broker outage, and an uncertain acknowledgement can leave its Kafka outcome unknown. The command offset still records the earlier ROS publish handoff.
+
+## Week 2 / Lab 8 — Persist simulator receipts
+
+Start Kafka and MSSQL, apply the migration, and provision both topics before starting the API, Bridge, and simulator.
+
+```powershell
+docker compose up --wait kafka mssql
+docker compose run --build --rm migrations
+foreach ($topic in @('robot.commands', 'robot.events')) {
+    docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic $topic --partitions 1 --replication-factor 1
+}
+docker compose --profile lab7 up --build --wait api bridge simulator
+docker compose exec bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic info /demo/commands --verbose && ros2 topic info /demo/receipts --verbose'
+```
+
+After DDS discovers both topic pairs, submit a command and poll its status.
+
+```powershell
+$baseUrl = 'http://127.0.0.1:8080/api/messages'
+$body = @{ content = 'Lab 8 receipt verification' } | ConvertTo-Json
+$message = Invoke-RestMethod $baseUrl -Method Post -ContentType application/json -Body $body
+foreach ($attempt in 1..20) {
+    $result = Invoke-RestMethod "$baseUrl/$($message.messageId)"
+    if ($result.status -eq 'Acknowledged') { break }
+    Start-Sleep -Seconds 1
+}
+$result
+docker compose logs --tail 30 api bridge simulator
+docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:29092 --describe --group robotics-fleet-receipts
+```
+
+The API hosts the `robotics-fleet-receipts` consumer. It starts at the earliest available offset when the group has none and commits explicitly after a successful SQL update, a confirmed duplicate, or a confirmed unmatched receipt. If SQL processing or offset commit fails, the consumer halts while HTTP remains available. Malformed records also halt the consumer with the offset uncommitted pending an approved disposition. Resolve the failure before restarting the API. A successful SQL write followed by an unconfirmed commit can cause redelivery. The conditional update preserves the first receipt timestamp.
+
+Run the isolated acceptance suite with PowerShell 7.5 or later. It exercises the round trip, duplicates, unmatched receipts, a SQL outage and recovery, and a mismatched Kafka key. Its Compose volumes are retained.
+
+```powershell
+pwsh -NoProfile -File ./tests/lab8-receipts.ps1
+```

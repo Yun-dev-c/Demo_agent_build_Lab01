@@ -30,6 +30,7 @@ builder.Services.AddSingleton<IProducer<string, string>>(services =>
     }).Build();
 });
 builder.Services.AddProblemDetails();
+builder.Services.AddHostedService<ReceiptConsumer>();
 
 var app = builder.Build();
 
