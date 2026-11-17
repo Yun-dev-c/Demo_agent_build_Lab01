@@ -2,6 +2,7 @@ using Confluent.Kafka;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
+using OpenTelemetry.Metrics;
 using RoboticsFleet.Api.Data;
 using RoboticsFleet.Api.Messages;
 
@@ -31,6 +32,10 @@ builder.Services.AddSingleton<IProducer<string, string>>(services =>
     }).Build();
 });
 builder.Services.AddProblemDetails();
+builder.Services.AddSingleton<ReceiptMetrics>();
+builder.Services.AddOpenTelemetry().WithMetrics(metrics => metrics
+    .AddMeter(ReceiptMetrics.MeterName)
+    .AddPrometheusExporter());
 builder.Services.AddSingleton<ReceiptConsumerHealth>();
 builder.Services.AddHealthChecks()
     .AddCheck<SqlReadinessCheck>("mssql", tags: ["ready"], timeout: TimeSpan.FromSeconds(2))
@@ -46,6 +51,7 @@ app.UseExceptionHandler(new ExceptionHandlerOptions
 
 app.MapPost("/api/messages", MessageEndpoints.CreateAsync);
 app.MapGet("/api/messages/{messageId}", MessageEndpoints.GetAsync);
+app.MapPrometheusScrapingEndpoint();
 app.MapHealthChecks("/health/live", new HealthCheckOptions { Predicate = _ => false });
 app.MapHealthChecks("/health/ready", new HealthCheckOptions
 {

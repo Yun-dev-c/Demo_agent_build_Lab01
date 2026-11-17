@@ -1,10 +1,11 @@
 #Requires -Version 7.5
 # Run from the repository root.
-param([switch]$CheckHealth)
+param([switch]$CheckHealth, [switch]$CheckMonitoring)
 
 $ErrorActionPreference = 'Stop'
 $project = 'fleet-lab8-check-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $composeArgs = @('--profile', 'lab7', '-f', 'compose.yaml', '-f', 'tests/lab4.compose.yaml', '-p', $project)
+if ($CheckMonitoring) { $composeArgs = @('--profile', 'monitoring') + $composeArgs }
 $oldPassword = $env:MSSQL_SA_PASSWORD
 $env:MSSQL_SA_PASSWORD = 'Lab8!' + [guid]::NewGuid().ToString('N')
 
@@ -54,6 +55,21 @@ function Assert-Health($scenario, $readyStatus) {
     Write-Host "PASS $scenario live=200 Healthy ready=$readyStatus $expectedBody"
 }
 
+function Assert-Metric($expression, [scriptblock]$matchesValue) {
+    Wait-For $expression {
+        $query = [uri]::EscapeDataString($expression)
+        $response = Invoke-RestMethod "$promUrl/api/v1/query?query=$query" -TimeoutSec 5
+        foreach ($sample in $response.data.result) {
+            $value = $sample.value[1]
+            if (& $matchesValue $value) {
+                Write-Host "PASS Prometheus $expression = $value"
+                return $true
+            }
+        }
+        return $false
+    }
+}
+
 try {
     Write-Host "Isolated Compose project $project"
     Invoke-Compose up --wait kafka mssql
@@ -64,6 +80,24 @@ try {
     Invoke-Compose up --build --wait api bridge simulator
     $apiUrl = "http://$(Invoke-Compose port api 8080)"
     $baseUrl = "$apiUrl/api/messages"
+    if ($CheckMonitoring) {
+        Invoke-Compose up --wait prometheus grafana kafka-exporter
+        $promUrl = "http://$(Invoke-Compose port prometheus 9090)"
+        $grafanaUrl = "http://$(Invoke-Compose port grafana 3000)"
+        Assert-Metric 'up{job="robotics-api"}' { param($v) $v -eq '1' }
+        Assert-Metric 'up{job="kafka-exporter"}' { param($v) $v -eq '1' }
+        Assert-Metric 'kafka_brokers' { param($v) $v -eq '1' }
+        Wait-For 'Grafana dashboard and datasource' {
+            $dashboard = Invoke-WebRequest "$grafanaUrl/api/dashboards/uid/robotics-fleet" -SkipHttpErrorCheck -TimeoutSec 5
+            if ($dashboard.StatusCode -ne 200) { return $false }
+            $definition = $dashboard.Content | ConvertFrom-Json
+            $proxy = Invoke-WebRequest "$grafanaUrl/api/datasources/proxy/uid/robotics-prometheus/api/v1/query?query=up" -SkipHttpErrorCheck -TimeoutSec 5
+            return $definition.meta.provisioned -and $definition.dashboard.panels.Count -eq 7 -and
+                $proxy.StatusCode -eq 200 -and ($proxy.Content | ConvertFrom-Json).data.result.Count -ge 2
+        }
+        Write-Host 'PASS Grafana provisioned dashboard and working Prometheus datasource'
+        Assert-Metric 'robotics_consumer_last_success_timestamp_seconds' { param($v) $v -eq '0' }
+    }
     Wait-For 'both ROS topic pairs' {
         $commands = Invoke-Compose exec -T bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic info /demo/commands --verbose --no-daemon'
         $receipts = Invoke-Compose exec -T bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic info /demo/receipts --verbose --no-daemon'
@@ -101,6 +135,15 @@ try {
     Write-Host "GET 200 $($get | ConvertTo-Json -Compress)"
     Invoke-Compose logs --no-color bridge simulator api | Select-String -SimpleMatch $id | Out-Host
     Write-Host 'PASS HTTP to ROS to Kafka to SQL and GET'
+    if ($CheckMonitoring) {
+        $metrics = (Invoke-WebRequest "$apiUrl/metrics").Content
+        if ($metrics -notmatch 'robotics_receipts_processed_total' -or
+            $metrics -notmatch 'robotics_receipt_processing_duration_seconds_bucket' -or
+            $metrics -match [regex]::Escape($id)) { throw 'Unexpected API metric names or labels' }
+        Write-Host 'PASS API metrics expose receipt instruments without message IDs'
+        Assert-Metric 'robotics_receipts_processed_total{outcome="acknowledged"}' { param($v) $v -eq '1' }
+        Assert-Metric 'robotics_consumer_last_success_timestamp_seconds' { param($v) [long]$v -gt 0 }
+    }
 
     $unknown = [guid]::NewGuid().ToString()
     Send-Receipt $id '2026-11-16T00:00:00Z'
@@ -119,6 +162,15 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     }
     $logs | Select-String "Duplicate receipt for $id|Unmatched receipt for $unknown" | Out-Host
     Write-Host 'PASS duplicate kept first timestamp and unmatched created no row'
+    if ($CheckMonitoring) {
+        Assert-Metric 'robotics_receipts_processed_total{outcome="duplicate"}' { param($v) $v -eq '1' }
+        Assert-Metric 'robotics_receipts_processed_total{outcome="unmatched"}' { param($v) $v -eq '1' }
+        Assert-Metric 'histogram_quantile(0.95, sum by (le) (rate(robotics_receipt_processing_duration_seconds_bucket[5m])))' {
+            param($v) $v -ne 'NaN' -and [double]$v -gt 0
+        }
+        $lagQuery = 'kafka_consumergroup_lag{consumergroup="robotics-fleet-receipts",topic="robot.events",partition="0"}'
+        Assert-Metric $lagQuery { param($v) $v -eq '0' }
+    }
 
     if ($CheckHealth) {
         Invoke-Compose stop kafka
@@ -135,6 +187,11 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     }
     Assert-Group 3 5 2
     Write-Host 'PASS SQL failure left the failed and subsequent offsets uncommitted'
+    if ($CheckMonitoring) {
+        Assert-Metric 'robotics_receipts_failures_total{reason="database_error"}' { param($v) $v -eq '1' }
+        Assert-Metric 'sum(robotics_receipts_processed_total)' { param($v) $v -eq '3' }
+        Assert-Metric $lagQuery { param($v) $v -eq '2' }
+    }
 
     Invoke-Compose up --wait mssql
     if ($CheckHealth) {
@@ -146,6 +203,7 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     Invoke-Compose restart api
     Assert-Group 5 5 0
     Write-Host 'PASS restart processed both outstanding receipts'
+    if ($CheckMonitoring) { Assert-Metric $lagQuery { param($v) $v -eq '0' } }
     if ($CheckHealth) {
         $apiUrl = "http://$(Invoke-Compose port api 8080)"
         Assert-Health 'API restarted after SQL failure' 200
@@ -157,6 +215,9 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     }
     Assert-Group 5 6 1
     Write-Host 'PASS invalid key halted the consumer without committing'
+    if ($CheckMonitoring) {
+        Assert-Metric 'robotics_receipts_failures_total{reason="invalid_receipt"}' { param($v) $v -eq '1' }
+    }
     if ($CheckHealth) { Assert-Health 'fatal malformed receipt with healthy dependencies' 503 }
 }
 finally {

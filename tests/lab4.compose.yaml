@@ -7,3 +7,11 @@ services:
     ports: !reset []
   kafka:
     ports: !reset []
+  prometheus:
+    ports: !override
+      - target: 9090
+        host_ip: 127.0.0.1
+  grafana:
+    ports: !override
+      - target: 3000
+        host_ip: 127.0.0.1

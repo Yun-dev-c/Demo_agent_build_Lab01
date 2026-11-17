@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using Confluent.Kafka;
 using Microsoft.EntityFrameworkCore;
@@ -6,7 +7,7 @@ using RoboticsFleet.Api.Data;
 namespace RoboticsFleet.Api.Messages;
 
 internal sealed class ReceiptConsumer(
-    IConfiguration configuration, IServiceScopeFactory scopeFactory, ReceiptConsumerHealth health,
+    IConfiguration configuration, IServiceScopeFactory scopeFactory, ReceiptConsumerHealth health, ReceiptMetrics metrics,
     ILogger<ReceiptConsumer> logger)
     : BackgroundService
 {
@@ -17,6 +18,7 @@ internal sealed class ReceiptConsumer(
     {
         IConsumer<string, string>? consumer = null;
         ConsumeResult<string, string>? record = null;
+        var failureReason = "unexpected_error";
         try
         {
             consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
@@ -35,10 +37,16 @@ internal sealed class ReceiptConsumer(
             {
                 record = null;
                 record = consumer.Consume(stoppingToken);
+                var startedAt = Stopwatch.GetTimestamp();
+                failureReason = "invalid_receipt";
                 var (messageId, receivedAt) = ParseReceipt(record.Message.Key, record.Message.Value);
-                await PersistReceiptAsync(messageId, receivedAt, stoppingToken);
+                failureReason = "database_error";
+                var outcome = await PersistReceiptAsync(messageId, receivedAt, stoppingToken);
                 stoppingToken.ThrowIfCancellationRequested();
+                failureReason = "kafka_commit_error";
                 consumer.Commit(record);
+                failureReason = "unexpected_error";
+                metrics.RecordSuccess(outcome, Stopwatch.GetElapsedTime(startedAt).TotalSeconds);
                 logger.LogInformation("Committed receipt {MessageId} at {Offset}", messageId, record.TopicPartitionOffset);
             }
         }
@@ -49,6 +57,7 @@ internal sealed class ReceiptConsumer(
         catch (Exception error)
         {
             health.MarkFaulted();
+            metrics.RecordFailure(failureReason);
             // Stop consuming so a later record cannot commit past the failed offset.
             logger.LogError(error, "Receipt consumer halted at {Offset}. Restart after resolving the failure.",
                 record?.TopicPartitionOffset);
@@ -72,7 +81,7 @@ internal sealed class ReceiptConsumer(
         }
     }
 
-    private async Task PersistReceiptAsync(Guid messageId, DateTimeOffset receivedAt, CancellationToken cancellationToken)
+    private async Task<string> PersistReceiptAsync(Guid messageId, DateTimeOffset receivedAt, CancellationToken cancellationToken)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<RoboticsFleetDbContext>();
@@ -85,7 +94,7 @@ internal sealed class ReceiptConsumer(
         if (updated == 1)
         {
             logger.LogInformation("Acknowledged message {MessageId} at {ReceivedAt}", messageId, receivedAt);
-            return;
+            return "acknowledged";
         }
 
         var status = await matching.Select(message => (MessageStatus?)message.Status)
@@ -94,10 +103,10 @@ internal sealed class ReceiptConsumer(
         {
             case null:
                 logger.LogWarning("Unmatched receipt for {MessageId}", messageId);
-                break;
+                return "unmatched";
             case MessageStatus.Acknowledged:
                 logger.LogInformation("Duplicate receipt for {MessageId}; keeping first timestamp", messageId);
-                break;
+                return "duplicate";
             default:
                 throw new InvalidOperationException($"Unexpected status after updating receipt {messageId}.");
         }

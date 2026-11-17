@@ -5,6 +5,39 @@ x-database-environment: &database-environment
   MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in .env}"
 
 services:
+  prometheus:
+    profiles: [monitoring]
+    image: prom/prometheus:v3.5.0
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    profiles: [monitoring]
+    image: grafana/grafana:12.3.0
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+  kafka-exporter:
+    profiles: [monitoring]
+    image: danielqsj/kafka-exporter:v1.10.0
+    command:
+      - --kafka.server=kafka:29092
+      - '--topic.filter=^robot[.]events$'
+      - '--group.filter=^robotics-fleet-receipts$'
+    depends_on:
+      kafka:
+        condition: service_healthy
+
   bridge:
     profiles: [lab6, lab7]
     build:
@@ -92,5 +125,7 @@ services:
       start_period: 30s
 
 volumes:
+  prometheus-data:
+  grafana-data:
   mssql-data:
   kafka-data:

@@ -226,3 +226,50 @@ curl.exe -i http://127.0.0.1:8080/health/ready
 SQL restoration recovers readiness if the worker stayed operational. If a receipt encountered a SQL error, the worker halts and readiness stays unhealthy. Check `docker compose logs --tail 50 api`, resolve the failure, and run `docker compose restart api` to resume at the outstanding offset. A malformed receipt remains pending a disposition decision and will halt the worker again after restart.
 
 The HTTP probes expose readiness separately from Docker container status. The API runtime image has neither curl nor wget, so the probes run from the host without adding an in-container dependency. Docker Compose health status alone provides no automatic restart or application recovery. Readiness reflects recent consumer observations and SQL connectivity. It can take a few seconds to reflect a broker disconnect. Kafka lag, simulator availability, and receipt delivery are outside the readiness check.
+
+## Lab 10 — Metrics and dashboard
+
+The API publishes OpenTelemetry metrics from `System.Diagnostics.Metrics`. Prometheus scrapes the API and Kafka exporter every five seconds over the Compose network. Grafana loads its Prometheus datasource and Robotics Fleet Operations dashboard from the files under `monitoring/grafana`. Prometheus and Grafana store data in named Docker volumes.
+
+Run the Lab 8 startup commands first, then start monitoring.
+
+```powershell
+docker compose --profile monitoring up -d prometheus grafana kafka-exporter
+```
+
+| Local URL | Use |
+| --- | --- |
+| http://127.0.0.1:8080/metrics | API exposition text |
+| http://127.0.0.1:9090/targets | Prometheus target status |
+| http://127.0.0.1:3000/d/robotics-fleet | Provisioned dashboard with anonymous Viewer access |
+| http://127.0.0.1:8080/health/ready | Actual readiness |
+
+The published ports bind to loopback. The Kafka exporter uses the existing internal plaintext broker listener at `kafka:29092` with topic and group filters. Its metrics port is internal.
+
+| Exported metric | Meaning |
+| --- | --- |
+| `robotics_receipts_processed_total` | Committed receipts by `outcome` with values `acknowledged`, `duplicate`, and `unmatched`. |
+| `robotics_receipts_failures_total` | Terminal processing failures by stage under `reason` with values `invalid_receipt`, `database_error`, `kafka_commit_error`, and `unexpected_error`. |
+| `robotics_receipt_processing_duration_seconds_bucket`, `_sum`, `_count` | Histogram for successful receipts. Elapsed monotonic time spans validation, SQL persistence or lookup, and Kafka offset commit. Kafka polling and failed attempts are outside this measurement. |
+| `robotics_consumer_last_success_timestamp_seconds` | Unix timestamp of the latest successful commit in this process. Zero means no success since startup. |
+| `kafka_consumergroup_lag` | Per-partition Kafka log-end offset minus the group's committed offset. The dashboard excludes negative values used for unknown lag. |
+| `up{job="robotics-api"}` | Availability of the API metrics scrape. Readiness comes from the separate HTTP endpoint and has no dashboard panel. |
+
+```promql
+sum(rate(robotics_receipts_processed_total[5m]))
+sum by (outcome) (increase(robotics_receipts_processed_total[5m]))
+sum by (reason) (increase(robotics_receipts_failures_total[5m]))
+histogram_quantile(0.95, sum by (le) (rate(robotics_receipt_processing_duration_seconds_bucket[5m])))
+time() - (robotics_consumer_last_success_timestamp_seconds > 0)
+sum(kafka_consumergroup_lag{consumergroup="robotics-fleet-receipts",topic="robot.events"} >= 0)
+up{job="robotics-api"}
+```
+
+Use the isolated test to inject an MSSQL outage, queue receipts, verify backlog growth, restore MSSQL, and restart the API. The same test injects a mismatched key to exercise validation failure. The script preserves volumes. On the development stack, inspect the group directly if the exporter is unavailable.
+
+```powershell
+pwsh -NoProfile -File ./tests/lab8-receipts.ps1 -CheckHealth -CheckMonitoring
+docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:29092 --describe --group robotics-fleet-receipts
+```
+
+See Lab 9 for manual SQL fault recovery. The ASP.NET Core Prometheus exporter is pinned to a prerelease. Application counters and the last-success gauge reset with the API process. Label series appear when first recorded, and rates and P95 need multiple scrapes and recent observations. Lag depends on broker reachability and an existing committed group offset.
