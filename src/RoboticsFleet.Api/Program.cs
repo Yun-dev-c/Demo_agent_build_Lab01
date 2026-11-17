@@ -1,4 +1,5 @@
 using Confluent.Kafka;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using RoboticsFleet.Api.Data;
@@ -30,6 +31,10 @@ builder.Services.AddSingleton<IProducer<string, string>>(services =>
     }).Build();
 });
 builder.Services.AddProblemDetails();
+builder.Services.AddSingleton<ReceiptConsumerHealth>();
+builder.Services.AddHealthChecks()
+    .AddCheck<SqlReadinessCheck>("mssql", tags: ["ready"], timeout: TimeSpan.FromSeconds(2))
+    .AddCheck<ReceiptConsumerHealth>("receipt-consumer", tags: ["ready"]);
 builder.Services.AddHostedService<ReceiptConsumer>();
 
 var app = builder.Build();
@@ -41,6 +46,11 @@ app.UseExceptionHandler(new ExceptionHandlerOptions
 
 app.MapPost("/api/messages", MessageEndpoints.CreateAsync);
 app.MapGet("/api/messages/{messageId}", MessageEndpoints.GetAsync);
+app.MapHealthChecks("/health/live", new HealthCheckOptions { Predicate = _ => false });
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready")
+});
 
 app.Run();
 

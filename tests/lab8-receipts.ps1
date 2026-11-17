@@ -1,5 +1,7 @@
 #Requires -Version 7.5
 # Run from the repository root.
+param([switch]$CheckHealth)
+
 $ErrorActionPreference = 'Stop'
 $project = 'fleet-lab8-check-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $composeArgs = @('--profile', 'lab7', '-f', 'compose.yaml', '-f', 'tests/lab4.compose.yaml', '-p', $project)
@@ -35,6 +37,23 @@ function Assert-Group($offset, $end, $lag) {
     }
 }
 
+function Assert-Health($scenario, $readyStatus) {
+    Wait-For "$scenario readiness $readyStatus" {
+        $ready = Invoke-WebRequest "$apiUrl/health/ready" -SkipHttpErrorCheck -TimeoutSec 6
+        return $ready.StatusCode -eq $readyStatus
+    }
+    $live = Invoke-WebRequest "$apiUrl/health/live" -SkipHttpErrorCheck -TimeoutSec 6
+    if ($live.StatusCode -ne 200 -or $live.Content -ne 'Healthy') {
+        throw "Liveness failed during $scenario"
+    }
+    $ready = Invoke-WebRequest "$apiUrl/health/ready" -SkipHttpErrorCheck -TimeoutSec 6
+    $expectedBody = if ($readyStatus -eq 200) { 'Healthy' } else { 'Unhealthy' }
+    if ($ready.StatusCode -ne $readyStatus -or $ready.Content -ne $expectedBody) {
+        throw "Unexpected readiness result during $scenario"
+    }
+    Write-Host "PASS $scenario live=200 Healthy ready=$readyStatus $expectedBody"
+}
+
 try {
     Write-Host "Isolated Compose project $project"
     Invoke-Compose up --wait kafka mssql
@@ -43,7 +62,8 @@ try {
         Invoke-Compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic $topic --partitions 1 --replication-factor 1
     }
     Invoke-Compose up --build --wait api bridge simulator
-    $baseUrl = "http://$(Invoke-Compose port api 8080)/api/messages"
+    $apiUrl = "http://$(Invoke-Compose port api 8080)"
+    $baseUrl = "$apiUrl/api/messages"
     Wait-For 'both ROS topic pairs' {
         $commands = Invoke-Compose exec -T bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic info /demo/commands --verbose --no-daemon'
         $receipts = Invoke-Compose exec -T bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic info /demo/receipts --verbose --no-daemon'
@@ -52,6 +72,16 @@ try {
             ($receipts -match 'Node name: robotics_fleet_bridge') -and
             ($receipts -match 'Node name: robotics_fleet_simulator')
     }
+    if ($CheckHealth) {
+        Assert-Health 'normal operation' 200
+        Start-Sleep -Seconds 12
+        Assert-Health 'empty topic beyond statistics expiry' 200
+        Invoke-Compose stop mssql
+        Assert-Health 'MSSQL unavailable while worker is idle' 503
+        Invoke-Compose up --wait mssql
+        Assert-Health 'MSSQL restored while worker is still running' 200
+    }
+
     $post = Invoke-WebRequest $baseUrl -Method Post -ContentType application/json -Body '{"content":"Lab 8 receipt verification"}'
     $id = ($post.Content | ConvertFrom-Json).messageId
     if ($post.StatusCode -ne 201 -or !$id) { throw 'POST did not create a message' }
@@ -90,6 +120,13 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     $logs | Select-String "Duplicate receipt for $id|Unmatched receipt for $unknown" | Out-Host
     Write-Host 'PASS duplicate kept first timestamp and unmatched created no row'
 
+    if ($CheckHealth) {
+        Invoke-Compose stop kafka
+        Assert-Health 'Kafka unavailable' 503
+        Invoke-Compose up --wait kafka
+        Assert-Health 'Kafka restored' 200
+    }
+
     Invoke-Compose stop mssql
     Send-Receipt $id $receipt.receivedAt
     Send-Receipt $unknown $receipt.receivedAt
@@ -100,9 +137,19 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     Write-Host 'PASS SQL failure left the failed and subsequent offsets uncommitted'
 
     Invoke-Compose up --wait mssql
+    if ($CheckHealth) {
+        Assert-Health 'MSSQL restored after worker fault' 503
+        $stillResponding = Invoke-WebRequest "$baseUrl/$id"
+        if ($stillResponding.StatusCode -ne 200) { throw 'HTTP GET failed after consumer halt' }
+        Write-Host 'PASS HTTP message GET returned 200 after consumer halt'
+    }
     Invoke-Compose restart api
     Assert-Group 5 5 0
     Write-Host 'PASS restart processed both outstanding receipts'
+    if ($CheckHealth) {
+        $apiUrl = "http://$(Invoke-Compose port api 8080)"
+        Assert-Health 'API restarted after SQL failure' 200
+    }
 
     Send-Receipt $id $receipt.receivedAt $unknown
     Wait-For 'consumer halt on key mismatch' {
@@ -110,6 +157,7 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     }
     Assert-Group 5 6 1
     Write-Host 'PASS invalid key halted the consumer without committing'
+    if ($CheckHealth) { Assert-Health 'fatal malformed receipt with healthy dependencies' 503 }
 }
 finally {
     try { Invoke-Compose down }

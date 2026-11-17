@@ -195,3 +195,34 @@ Run the isolated acceptance suite with PowerShell 7.5 or later. It exercises the
 ```powershell
 pwsh -NoProfile -File ./tests/lab8-receipts.ps1
 ```
+
+## Lab 9 — Liveness and readiness
+
+| URL | Meaning |
+| --- | --- |
+| `http://127.0.0.1:8080/health/live` | The HTTP process can respond. |
+| `http://127.0.0.1:8080/health/ready` | MSSQL accepts a connection and the receipt consumer is operational. |
+
+Both endpoints return plain text. A healthy probe returns HTTP `200` with `Healthy`. An unhealthy readiness probe returns HTTP `503` with `Unhealthy`. The SQL connection probe has a two-second timeout. The consumer reports Kafka statistics every two seconds. Readiness requires an active partition assignment, a connected broker, and statistics observed within ten seconds. An idle topic still produces these statistics.
+
+Run the isolated failure checks from the repository root. The script retains its Docker volumes.
+
+```powershell
+pwsh -NoProfile -File ./tests/lab8-receipts.ps1 -CheckHealth
+```
+
+To see the liveness and readiness split manually on your development stack, provision both Kafka topics and start the services as shown in Lab 8. Allow the consumer to join its group, and keep receipt traffic idle for this exercise.
+
+```powershell
+curl.exe -i http://127.0.0.1:8080/health/live
+curl.exe -i http://127.0.0.1:8080/health/ready
+docker compose stop mssql
+curl.exe -i http://127.0.0.1:8080/health/live
+curl.exe -i http://127.0.0.1:8080/health/ready
+docker compose up --wait mssql
+curl.exe -i http://127.0.0.1:8080/health/ready
+```
+
+SQL restoration recovers readiness if the worker stayed operational. If a receipt encountered a SQL error, the worker halts and readiness stays unhealthy. Check `docker compose logs --tail 50 api`, resolve the failure, and run `docker compose restart api` to resume at the outstanding offset. A malformed receipt remains pending a disposition decision and will halt the worker again after restart.
+
+The HTTP probes expose readiness separately from Docker container status. The API runtime image has neither curl nor wget, so the probes run from the host without adding an in-container dependency. Docker Compose health status alone provides no automatic restart or application recovery. Readiness reflects recent consumer observations and SQL connectivity. It can take a few seconds to reflect a broker disconnect. Kafka lag, simulator availability, and receipt delivery are outside the readiness check.

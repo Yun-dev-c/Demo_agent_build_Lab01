@@ -6,7 +6,8 @@ using RoboticsFleet.Api.Data;
 namespace RoboticsFleet.Api.Messages;
 
 internal sealed class ReceiptConsumer(
-    IConfiguration configuration, IServiceScopeFactory scopeFactory, ILogger<ReceiptConsumer> logger)
+    IConfiguration configuration, IServiceScopeFactory scopeFactory, ReceiptConsumerHealth health,
+    ILogger<ReceiptConsumer> logger)
     : BackgroundService
 {
     private const string Topic = "robot.events";
@@ -14,19 +15,20 @@ internal sealed class ReceiptConsumer(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        using var consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
-        {
-            BootstrapServers = configuration["Kafka:BootstrapServers"] ?? "127.0.0.1:9092",
-            GroupId = Group,
-            AutoOffsetReset = AutoOffsetReset.Earliest,
-            EnableAutoCommit = false,
-            EnableAutoOffsetStore = false,
-            AllowAutoCreateTopics = true
-        }).Build();
-
+        IConsumer<string, string>? consumer = null;
         ConsumeResult<string, string>? record = null;
         try
         {
+            consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
+            {
+                BootstrapServers = configuration["Kafka:BootstrapServers"] ?? "127.0.0.1:9092",
+                GroupId = Group,
+                AutoOffsetReset = AutoOffsetReset.Earliest,
+                EnableAutoCommit = false,
+                EnableAutoOffsetStore = false,
+                AllowAutoCreateTopics = true,
+                StatisticsIntervalMs = 2000
+            }).SetStatisticsHandler((_, statistics) => health.ObserveStatistics(statistics)).Build();
             consumer.Subscribe(Topic);
             logger.LogInformation("Consuming {Topic} as {Group}", Topic, Group);
             while (!stoppingToken.IsCancellationRequested)
@@ -46,13 +48,27 @@ internal sealed class ReceiptConsumer(
         }
         catch (Exception error)
         {
+            health.MarkFaulted();
             // Stop consuming so a later record cannot commit past the failed offset.
             logger.LogError(error, "Receipt consumer halted at {Offset}. Restart after resolving the failure.",
                 record?.TopicPartitionOffset);
         }
         finally
         {
-            consumer.Close();
+            health.MarkStopped();
+            try
+            {
+                consumer?.Close();
+            }
+            catch (KafkaException error)
+            {
+                health.MarkFaulted();
+                logger.LogWarning(error, "Could not close the receipt consumer cleanly.");
+            }
+            finally
+            {
+                consumer?.Dispose();
+            }
         }
     }
 
