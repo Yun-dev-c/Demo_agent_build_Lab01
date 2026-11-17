@@ -13,7 +13,7 @@ internal sealed class ReceiptMetrics : IDisposable
     private readonly ILogger<ReceiptMetrics> logger;
     private long lastSuccess;
 
-    public ReceiptMetrics(ILogger<ReceiptMetrics> logger)
+    public ReceiptMetrics(ILogger<ReceiptMetrics> logger, ReceiptConsumerHealth health)
     {
         this.logger = logger;
         processed = meter.CreateCounter<long>("robotics_receipts_processed");
@@ -25,6 +25,8 @@ internal sealed class ReceiptMetrics : IDisposable
             });
         meter.CreateObservableGauge("robotics_consumer_last_success_timestamp",
             () => Interlocked.Read(ref lastSuccess), "s");
+        meter.CreateObservableGauge("robotics_receipt_consumer_available",
+            () => health.GetHealth().Status == Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Healthy ? 1 : 0);
     }
 
     internal void RecordSuccess(string outcome, double seconds)

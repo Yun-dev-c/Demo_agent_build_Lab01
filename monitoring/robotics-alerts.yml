@@ -1,0 +1,45 @@
+groups:
+  - name: robotics-fleet
+    rules:
+      - alert: RoboticsApiMetricsDown
+        expr: up{job="robotics-api"} == 0
+        for: 30s
+        labels:
+          service: robotics-fleet
+          severity: critical
+        annotations:
+          summary: Prometheus cannot scrape API metrics
+      - alert: RoboticsReceiptLagHigh
+        expr: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="robotics-fleet-receipts",topic="robot.events"} > 0 and on(job, instance) up{job="kafka-exporter"} == 1
+        for: 60s
+        labels:
+          service: robotics-fleet
+          severity: warning
+        annotations:
+          summary: Receipt group has a sustained Kafka backlog
+      - alert: RoboticsReceiptConsumerUnavailable
+        expr: robotics_receipt_consumer_available{job="robotics-api"} == 0 and on(job, instance) up{job="robotics-api"} == 1
+        for: 15s
+        labels:
+          service: robotics-fleet
+          severity: critical
+        annotations:
+          summary: API reports its receipt consumer unavailable
+      - alert: RoboticsTelemetryMissing
+        expr: absent(up{job="robotics-api"}) or (up{job="robotics-api"} == 1 unless on(job, instance) robotics_receipt_consumer_available{job="robotics-api"})
+        for: 60s
+        labels:
+          service: robotics-fleet
+          severity: warning
+          signal: receipt-consumer
+        annotations:
+          summary: API target or receipt consumer health signal is missing
+      - alert: RoboticsTelemetryMissing
+        expr: absent(up{job="kafka-exporter"}) or up{job="kafka-exporter"} == 0 or (up{job="kafka-exporter"} == 1 unless on(job, instance) (kafka_consumergroup_lag{job="kafka-exporter",consumergroup="robotics-fleet-receipts",topic="robot.events"} >= 0))
+        for: 60s
+        labels:
+          service: robotics-fleet
+          severity: warning
+          signal: receipt-lag
+        annotations:
+          summary: Kafka exporter or usable receipt-group lag is unavailable

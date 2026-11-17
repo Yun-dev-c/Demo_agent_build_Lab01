@@ -1,21 +1,30 @@
 #Requires -Version 7.5
 # Run from the repository root.
-param([switch]$CheckHealth, [switch]$CheckMonitoring)
+param([switch]$CheckHealth, [switch]$CheckMonitoring, [switch]$CheckAlerting)
 
 $ErrorActionPreference = 'Stop'
+if ($CheckAlerting) {
+    $CheckMonitoring = $true
+    $CheckHealth = $true
+}
 $project = 'fleet-lab8-check-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $composeArgs = @('--profile', 'lab7', '-f', 'compose.yaml', '-f', 'tests/lab4.compose.yaml', '-p', $project)
 if ($CheckMonitoring) { $composeArgs = @('--profile', 'monitoring') + $composeArgs }
 $oldPassword = $env:MSSQL_SA_PASSWORD
 $env:MSSQL_SA_PASSWORD = 'Lab8!' + [guid]::NewGuid().ToString('N')
+if ($CheckAlerting) {
+    New-Item -ItemType Directory -Path TestResults -Force | Out-Null
+    $alertEvidence = Join-Path TestResults "$project-alerts.jsonl"
+    Write-Host "Alert evidence: $alertEvidence"
+}
 
 function Invoke-Compose {
     docker compose @composeArgs @args
     if ($LASTEXITCODE -ne 0) { throw "Compose failed: $($args -join ' ')" }
 }
 
-function Wait-For($description, [scriptblock]$check) {
-    foreach ($attempt in 1..45) {
+function Wait-For($description, [scriptblock]$check, [int]$attempts = 45) {
+    foreach ($attempt in 1..$attempts) {
         if (& $check) { return }
         Start-Sleep -Seconds 1
     }
@@ -70,6 +79,44 @@ function Assert-Metric($expression, [scriptblock]$matchesValue) {
     }
 }
 
+function Save-AlertEvidence($scenario) {
+    $evidence = [ordered]@{
+        scenario = $scenario
+        observedAt = [datetimeoffset]::UtcNow.ToString('o')
+        prometheus = Invoke-RestMethod "$promUrl/api/v1/alerts" -TimeoutSec 5
+        alertmanager = @(Invoke-RestMethod "$alertUrl/api/v2/alerts/groups" -TimeoutSec 5)
+        kafkaOffsets = @(Invoke-Compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:29092 --describe --group robotics-fleet-receipts)
+        liveHttp = (Invoke-WebRequest "$apiUrl/health/live" -SkipHttpErrorCheck -TimeoutSec 5).StatusCode
+        readyHttp = (Invoke-WebRequest "$apiUrl/health/ready" -SkipHttpErrorCheck -TimeoutSec 5).StatusCode
+    }
+    $evidence | ConvertTo-Json -Depth 20 -Compress | Add-Content -LiteralPath $alertEvidence
+}
+
+function Wait-Alerts([string[]]$names, [switch]$Resolved, [string]$Signal) {
+    $mode = if ($Resolved) { 'resolved' } else { 'firing and grouped' }
+    function Select-Alerts($alerts) {
+        $alerts | Where-Object { $_.labels.alertname -in $names -and (!$Signal -or $_.labels.signal -eq $Signal) }
+    }
+    Wait-For "$($names -join ', ') $mode" {
+        $alerts = (Invoke-RestMethod "$promUrl/api/v1/alerts" -TimeoutSec 5).data.alerts
+        $groups = @(Invoke-RestMethod "$alertUrl/api/v2/alerts/groups" -TimeoutSec 5)
+        if ($Resolved) {
+            return @(Select-Alerts $alerts).Count -eq 0 -and @(Select-Alerts ($groups.alerts)).Count -eq 0
+        }
+        $firing = @(Select-Alerts ($alerts | Where-Object state -eq 'firing'))
+        if (@($firing.labels.alertname | Sort-Object -Unique).Count -ne $names.Count) { return $false }
+        foreach ($group in $groups) {
+            $received = @(Select-Alerts $group.alerts)
+            if ($group.labels.service -eq 'robotics-fleet' -and $group.receiver.name -eq 'local' -and
+                $received.Count -eq $names.Count -and @($received.labels.alertname | Sort-Object -Unique).Count -eq $names.Count) {
+                return $true
+            }
+        }
+        return $false
+    } 100
+    Write-Host "PASS alerts $($names -join ', ') $mode"
+}
+
 try {
     Write-Host "Isolated Compose project $project"
     Invoke-Compose up --wait kafka mssql
@@ -84,6 +131,12 @@ try {
         Invoke-Compose up --wait prometheus grafana kafka-exporter
         $promUrl = "http://$(Invoke-Compose port prometheus 9090)"
         $grafanaUrl = "http://$(Invoke-Compose port grafana 3000)"
+        if ($CheckAlerting) {
+            Invoke-Compose up --wait alertmanager
+            $alertUrl = "http://$(Invoke-Compose port alertmanager 9093)"
+            Invoke-Compose exec -T prometheus promtool check config /etc/prometheus/prometheus.yml
+            Invoke-Compose exec -T alertmanager amtool check-config /etc/alertmanager/alertmanager.yml
+        }
         Assert-Metric 'up{job="robotics-api"}' { param($v) $v -eq '1' }
         Assert-Metric 'up{job="kafka-exporter"}' { param($v) $v -eq '1' }
         Assert-Metric 'kafka_brokers' { param($v) $v -eq '1' }
@@ -171,6 +224,36 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
         $lagQuery = 'kafka_consumergroup_lag{consumergroup="robotics-fleet-receipts",topic="robot.events",partition="0"}'
         Assert-Metric $lagQuery { param($v) $v -eq '0' }
     }
+    if ($CheckAlerting) {
+        # Wait past the longest hold time with all required series present.
+        Start-Sleep -Seconds 65
+        $normal = (Invoke-RestMethod "$promUrl/api/v1/alerts").data.alerts
+        if ($normal.state -contains 'firing') { throw 'Unexpected firing alerts under normal operation' }
+        Save-AlertEvidence 'normal after hold periods'
+        Write-Host 'PASS no unexpected alerts under normal operation'
+
+        Invoke-Compose stop api
+        Wait-Alerts 'RoboticsApiMetricsDown'
+        $httpResult = try {
+            (Invoke-WebRequest "$apiUrl/health/live" -SkipHttpErrorCheck -TimeoutSec 3).StatusCode
+        } catch {
+            'No HTTP response'
+        }
+        if ($httpResult -ne 'No HTTP response') { throw "Expected stopped API, got HTTP $httpResult" }
+        [ordered]@{
+            scenario = 'API stopped'
+            observedAt = [datetimeoffset]::UtcNow.ToString('o')
+            prometheus = Invoke-RestMethod "$promUrl/api/v1/alerts"
+            alertmanager = @(Invoke-RestMethod "$alertUrl/api/v2/alerts/groups")
+            liveHttp = $httpResult
+        } | ConvertTo-Json -Depth 20 -Compress | Add-Content -LiteralPath $alertEvidence
+        Invoke-Compose up --wait api
+        $apiUrl = "http://$(Invoke-Compose port api 8080)"
+        $baseUrl = "$apiUrl/api/messages"
+        Assert-Health 'API restored' 200
+        Wait-Alerts 'RoboticsApiMetricsDown' -Resolved
+        Save-AlertEvidence 'API scrape recovered'
+    }
 
     if ($CheckHealth) {
         Invoke-Compose stop kafka
@@ -189,7 +272,9 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     Write-Host 'PASS SQL failure left the failed and subsequent offsets uncommitted'
     if ($CheckMonitoring) {
         Assert-Metric 'robotics_receipts_failures_total{reason="database_error"}' { param($v) $v -eq '1' }
-        Assert-Metric 'sum(robotics_receipts_processed_total)' { param($v) $v -eq '3' }
+        if (!$CheckAlerting) {
+            Assert-Metric 'sum(robotics_receipts_processed_total)' { param($v) $v -eq '3' }
+        }
         Assert-Metric $lagQuery { param($v) $v -eq '2' }
     }
 
@@ -200,6 +285,10 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
         if ($stillResponding.StatusCode -ne 200) { throw 'HTTP GET failed after consumer halt' }
         Write-Host 'PASS HTTP message GET returned 200 after consumer halt'
     }
+    if ($CheckAlerting) {
+        Wait-Alerts @('RoboticsReceiptLagHigh', 'RoboticsReceiptConsumerUnavailable')
+        Save-AlertEvidence 'SQL restored but consumer halted and lag sustained'
+    }
     Invoke-Compose restart api
     Assert-Group 5 5 0
     Write-Host 'PASS restart processed both outstanding receipts'
@@ -207,6 +296,16 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     if ($CheckHealth) {
         $apiUrl = "http://$(Invoke-Compose port api 8080)"
         Assert-Health 'API restarted after SQL failure' 200
+    }
+    if ($CheckAlerting) {
+        Wait-Alerts @('RoboticsReceiptLagHigh', 'RoboticsReceiptConsumerUnavailable') -Resolved
+        Save-AlertEvidence 'consumer restarted and lag cleared'
+        Invoke-Compose stop kafka-exporter
+        Wait-Alerts 'RoboticsTelemetryMissing' -Signal receipt-lag
+        Save-AlertEvidence 'Kafka exporter unavailable'
+        Invoke-Compose up --wait kafka-exporter
+        Wait-Alerts 'RoboticsTelemetryMissing' -Signal receipt-lag -Resolved
+        Save-AlertEvidence 'Kafka exporter recovered'
     }
 
     Send-Receipt $id $receipt.receivedAt $unknown

@@ -39,10 +39,13 @@ internal sealed class ReceiptConsumerHealth : IHealthCheck
     }
 
     public Task<HealthCheckResult> CheckHealthAsync(
-        HealthCheckContext context, CancellationToken cancellationToken = default)
+        HealthCheckContext context, CancellationToken cancellationToken = default) =>
+        Task.FromResult(GetHealth());
+
+    internal HealthCheckResult GetHealth()
     {
         var current = snapshot;
-        var result = current.Lifecycle switch
+        return current.Lifecycle switch
         {
             State.Running when Stopwatch.GetElapsedTime(current.ObservedAt) > StatisticsMaxAge =>
                 HealthCheckResult.Unhealthy("Consumer statistics are stale."),
@@ -51,7 +54,6 @@ internal sealed class ReceiptConsumerHealth : IHealthCheck
             _ => HealthCheckResult.Unhealthy($"Consumer is {current.Lifecycle}.")
         };
 
-        return Task.FromResult(result);
     }
 
     private enum State { Starting, Running, Faulted, Stopped }

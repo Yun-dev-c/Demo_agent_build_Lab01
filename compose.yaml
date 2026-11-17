@@ -12,7 +12,21 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/robotics-alerts.yml:/etc/prometheus/robotics-alerts.yml:ro
       - prometheus-data:/prometheus
+
+  alertmanager:
+    profiles: [monitoring]
+    image: prom/alertmanager:v0.35.0
+    ports:
+      - "127.0.0.1:9093:9093"
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --cluster.listen-address=
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
 
   grafana:
     profiles: [monitoring]
@@ -125,6 +139,7 @@ services:
       start_period: 30s
 
 volumes:
+  alertmanager-data:
   prometheus-data:
   grafana-data:
   mssql-data:

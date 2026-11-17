@@ -1,4 +1,8 @@
 services:
+  alertmanager:
+    ports: !override
+      - target: 9093
+        host_ip: 127.0.0.1
   api:
     ports: !override
       - target: 8080

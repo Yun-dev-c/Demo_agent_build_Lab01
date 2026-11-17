@@ -273,3 +273,48 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap
 ```
 
 See Lab 9 for manual SQL fault recovery. The ASP.NET Core Prometheus exporter is pinned to a prerelease. Application counters and the last-success gauge reset with the API process. Label series appear when first recorded, and rates and P95 need multiple scrapes and recent observations. Lag depends on broker reachability and an existing committed group offset.
+
+## Lab 11 — Alerting and incident response
+
+Start the existing Lab 8 stack, then run `docker compose --profile monitoring up -d prometheus grafana kafka-exporter alertmanager`. Prometheus evaluates rules every five seconds. View rules at [Prometheus Alerts](http://127.0.0.1:9090/alerts) and active alert groups at [Alertmanager](http://127.0.0.1:9093). Alertmanager groups by service, waits five seconds for the initial group, checks group changes every ten seconds, and repeats eligible notifications every four hours. The local receiver keeps alerts available in the UI and API without sending external notifications.
+
+Run these checks to distinguish an HTTP process outage, a readiness failure, and a broken scrape path.
+
+```powershell
+docker compose ps
+curl.exe -i http://127.0.0.1:8080/health/live
+curl.exe -i http://127.0.0.1:8080/health/ready
+curl.exe -i http://127.0.0.1:8080/metrics
+Invoke-RestMethod http://127.0.0.1:9090/api/v1/targets
+Invoke-RestMethod http://127.0.0.1:9090/api/v1/alerts
+Invoke-RestMethod http://127.0.0.1:9093/api/v2/alerts/groups
+```
+
+### RoboticsApiMetricsDown
+
+**Critical.** The API scrape reports `up == 0` for 30 seconds. The API may be stopped or the metrics route or Compose network may be unreachable. Check the Prometheus target's last error and compare it with the direct HTTP checks above. Use `docker compose logs --tail 50 api prometheus` to investigate. Start a stopped API with `docker compose up -d api` or fix the route or network if HTTP otherwise responds. Verify that `/metrics` returns 200, the target returns to UP, and the alert clears. This alert measures the scrape path.
+
+### RoboticsReceiptLagHigh
+
+**Warning.** At least one `robot.events` partition has positive lag for the `robotics-fleet-receipts` group for 60 seconds while the exporter is reachable. Slow SQL, a halted consumer, or a burst of receipts can cause it. Compare Kafka's committed and log-end offsets and inspect the consumer logs.
+
+```powershell
+docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:29092 --describe --group robotics-fleet-receipts
+docker compose logs --tail 50 api mssql kafka-exporter
+```
+
+Restore dependencies and restart a halted worker after resolving the error. Verify that the committed offset advances, lag returns to zero, and Prometheus clears the alert. Lag measures Kafka backlog and can be zero when the return path produces no receipts.
+
+### RoboticsReceiptConsumerUnavailable
+
+**Critical.** The API exposes its existing consumer health decision as `robotics_receipt_consumer_available` with values 1 and 0. An observed 0 for 15 seconds with a successful scrape triggers the alert. Starting, stopped, faulted, disconnected, unassigned, and stale-statistics states all report 0. Check `/health/live`, `/health/ready`, `docker compose logs --tail 50 api`, and the Kafka group command above. If SQL faulted the worker, restore SQL first with `docker compose up --wait mssql`, then `docker compose restart api`. For malformed receipts, obtain an approved disposition before restarting because the same record will be read again. Verify the gauge returns to 1, readiness returns 200 with SQL available, and the group resumes. Readiness can also fail independently because SQL is unavailable.
+
+### RoboticsTelemetryMissing
+
+**Warning.** A missing API target or missing consumer gauge on a successful scrape, or an absent/unreachable Kafka exporter or missing usable lag on a successful exporter scrape, persists for 60 seconds. Check the alert's `signal` label, Prometheus target errors, and `docker compose logs --tail 50 prometheus kafka-exporter`. Restore the target or exporter with `docker compose --profile monitoring up -d prometheus kafka-exporter` and verify the expected series returns and the alert clears. A new group has no committed offset before its first receipt, so lag is unknown until that commit. Verify the group directly with the Kafka CLI. A stopped Prometheus cannot evaluate any of these rules.
+
+Run the isolated failure and recovery exercise. It records raw alert snapshots, timestamps, offsets, and HTTP outcomes in `TestResults` and preserves Docker volumes.
+
+```powershell
+pwsh -NoProfile -File ./tests/lab8-receipts.ps1 -CheckAlerting
+```
