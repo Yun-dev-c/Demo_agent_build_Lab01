@@ -3,6 +3,9 @@ using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using OpenTelemetry.Metrics;
+using OpenTelemetry.Exporter;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using RoboticsFleet.Api.Data;
 using RoboticsFleet.Api.Messages;
 
@@ -35,7 +38,28 @@ builder.Services.AddProblemDetails();
 builder.Services.AddSingleton<ReceiptMetrics>();
 builder.Services.AddOpenTelemetry().WithMetrics(metrics => metrics
     .AddMeter(ReceiptMetrics.MeterName)
-    .AddPrometheusExporter());
+    .AddPrometheusExporter())
+    .WithTracing(tracing =>
+    {
+        tracing.SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("robotics-api"))
+            .AddAspNetCoreInstrumentation(options =>
+            {
+                options.Filter = context => HttpMethods.IsPost(context.Request.Method) &&
+                    context.Request.Path.Equals("/api/messages", StringComparison.OrdinalIgnoreCase);
+                options.EnrichWithHttpRequest = (activity, _) => activity.SetTag("url.query", null);
+            })
+            .AddSource(MessageEndpoints.ActivitySourceName);
+
+        var endpoint = builder.Configuration["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"];
+        if (!string.IsNullOrWhiteSpace(endpoint))
+        {
+            tracing.AddOtlpExporter(options =>
+            {
+                options.Endpoint = new Uri(endpoint);
+                options.Protocol = OtlpExportProtocol.HttpProtobuf;
+            });
+        }
+    });
 builder.Services.AddSingleton<ReceiptConsumerHealth>();
 builder.Services.AddHealthChecks()
     .AddCheck<SqlReadinessCheck>("mssql", tags: ["ready"], timeout: TimeSpan.FromSeconds(2))

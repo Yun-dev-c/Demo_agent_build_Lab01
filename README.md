@@ -365,3 +365,31 @@ docker compose up -d api
 ```
 
 During the stop, scrape status changes to **Scrape failed**, observed success drops, and observed budget consumption rises. After restart, wait for **Scrape succeeded**. The rolling ratio and budget retain the recorded failures until they age out of the window.
+
+## Lab 13 — Command submission traces
+
+A trace groups the timed operations for a command submission. Each span records one operation and its parent. ASP.NET Core reads the incoming W3C `traceparent` header and creates the server span for `POST /api/messages`. The `RoboticsFleet.Api.Commands` ActivitySource adds two child spans in sequence, `INSERT Messages` and `publish robot.commands`. Both use the same trace ID and refer to the HTTP span as their parent.
+
+The `robotics-api` tracing provider exports spans over OTLP HTTP to `http://jaeger:4318/v1/traces` inside Compose. Jaeger receives, stores and displays traces. The `monitoring` profile starts Jaeger and publishes its UI at `http://127.0.0.1:16686`. Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to an empty value in the Compose `.env` to disable export when running without Jaeger. The existing Prometheus metrics remain available independently.
+
+Run the isolated acceptance suite to verify successful and failed traces and rerun Labs 8–12. It saves raw Jaeger records under `TestResults` and preserves named Docker volumes.
+
+```powershell
+pwsh -NoProfile -File ./tests/lab8-receipts.ps1 -CheckTracing
+```
+
+On a running development stack with the database migrated, start the API and Jaeger, then submit a command with a known trace ID.
+
+```powershell
+docker compose --profile monitoring up -d --build api jaeger
+$traceId = [guid]::NewGuid().ToString('N')
+$parentId = [guid]::NewGuid().ToString('N').Substring(0, 16)
+Invoke-WebRequest http://127.0.0.1:8080/api/messages -Method Post `
+    -ContentType application/json -Body '{"content":"Lab 13 trace verification"}' `
+    -Headers @{ traceparent = "00-$traceId-$parentId-01" }
+"http://127.0.0.1:16686/trace/$traceId"
+```
+
+Allow a few seconds for batching before opening the printed URL. You can also search for service `robotics-api` in Jaeger. In a disposable stack, stop Kafka with `docker compose stop kafka`, rerun the request with fresh trace and parent IDs, and include `-SkipHttpErrorCheck` on `Invoke-WebRequest` to inspect the 503 response. Expand `publish robot.commands` in Jaeger to inspect its Error status and `exception.type` event. The SQL span should show that persistence completed. Restore the broker with `docker compose up --wait kafka`. The failed publication can leave a Pending row, as in the existing command flow.
+
+Traces use in-memory Jaeger storage and disappear when Jaeger restarts. The application spans include operation names, outcomes and exception types. Payloads, SQL connection details, exception messages and stack traces are excluded. The trace ends at the producer delivery result. Kafka consumers, Python Bridge, ROS2 and receipt processing have no trace propagation in this lab.

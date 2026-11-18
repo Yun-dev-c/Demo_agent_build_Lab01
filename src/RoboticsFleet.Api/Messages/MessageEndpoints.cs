@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using Confluent.Kafka;
 using Microsoft.AspNetCore.Http.Features;
@@ -9,7 +10,9 @@ namespace RoboticsFleet.Api.Messages;
 
 internal static class MessageEndpoints
 {
+    internal const string ActivitySourceName = "RoboticsFleet.Api.Commands";
     private const string CommandTopic = "robot.commands";
+    private static readonly ActivitySource CommandActivitySource = new(ActivitySourceName);
     private static readonly JsonSerializerOptions CommandJson = new(JsonSerializerDefaults.Web);
 
     internal static async Task<IResult> CreateAsync(
@@ -49,11 +52,28 @@ internal static class MessageEndpoints
 
         var message = new Message { Content = input.Content, CreatedAt = DateTimeOffset.UtcNow };
         db.Messages.Add(message);
-        await db.SaveChangesAsync(cancellationToken);
+        using (var persistence = CommandActivitySource.StartActivity("INSERT Messages", ActivityKind.Client))
+        {
+            persistence?.SetTag("db.system.name", "microsoft.sql_server");
+            persistence?.SetTag("db.operation.name", "INSERT");
+            try
+            {
+                await db.SaveChangesAsync(cancellationToken);
+            }
+            catch (Exception exception) when (!cancellationToken.IsCancellationRequested || exception is not OperationCanceledException)
+            {
+                RecordFailure(persistence, exception);
+                throw;
+            }
+        }
 
         var key = message.MessageId.ToString("D");
         var command = new RobotCommand(key, "PING", message.Content, message.CreatedAt.UtcDateTime);
         var logger = loggerFactory.CreateLogger(typeof(MessageEndpoints));
+        using var publication = CommandActivitySource.StartActivity("publish robot.commands", ActivityKind.Producer);
+        publication?.SetTag("messaging.system", "kafka");
+        publication?.SetTag("messaging.destination.name", CommandTopic);
+        publication?.SetTag("messaging.operation.name", "publish");
         try
         {
             // The SQL write is committed. Wait for the bounded delivery result even if the client disconnects.
@@ -68,18 +88,39 @@ internal static class MessageEndpoints
                 return Results.Created($"/api/messages/{key}", MessageResponse.From(message));
             }
 
+            publication?.SetStatus(ActivityStatusCode.Error, "Kafka delivery unconfirmed");
             logger.LogWarning("Kafka delivery for {MessageId} on {Topic} was {DeliveryStatus} after the SQL insert",
                 key, CommandTopic, delivery.Status);
         }
         catch (KafkaException exception)
         {
+            RecordFailure(publication, exception);
             logger.LogWarning(exception, "Kafka publication for {MessageId} on {Topic} failed after the SQL insert with {KafkaErrorCode}",
                 key, CommandTopic, exception.Error.Code);
+        }
+        catch (Exception exception)
+        {
+            RecordFailure(publication, exception);
+            throw;
         }
 
         return Results.Problem(
             statusCode: StatusCodes.Status503ServiceUnavailable,
             detail: "Command publication could not be confirmed.");
+    }
+
+    private static void RecordFailure(Activity? activity, Exception exception)
+    {
+        if (activity is null) { return; }
+
+        // Exception messages and stack traces may expose request or connection details.
+        var exceptionType = exception.GetType().FullName;
+        activity.SetStatus(ActivityStatusCode.Error);
+        activity.SetTag("error.type", exceptionType);
+        activity.AddEvent(new ActivityEvent("exception", tags: new ActivityTagsCollection
+        {
+            { "exception.type", exceptionType }
+        }));
     }
 
     internal static async Task<IResult> GetAsync(

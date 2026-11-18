@@ -5,6 +5,12 @@ x-database-environment: &database-environment
   MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in .env}"
 
 services:
+  jaeger:
+    profiles: [monitoring]
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.14.0
+    ports:
+      - "127.0.0.1:16686:16686"
+
   prometheus:
     profiles: [monitoring]
     image: prom/prometheus:v3.5.0
@@ -80,6 +86,7 @@ services:
       <<: *database-environment
       ASPNETCORE_HTTP_PORTS: "8080"
       Kafka__BootstrapServers: kafka:29092
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT-http://jaeger:4318/v1/traces}"
     ports:
       - "127.0.0.1:8080:8080"
 

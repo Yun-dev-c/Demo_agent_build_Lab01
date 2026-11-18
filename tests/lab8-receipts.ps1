@@ -1,8 +1,9 @@
 #Requires -Version 7.5
 # Run from the repository root.
-param([switch]$CheckHealth, [switch]$CheckMonitoring, [switch]$CheckAlerting, [switch]$CheckSlo)
+param([switch]$CheckHealth, [switch]$CheckMonitoring, [switch]$CheckAlerting, [switch]$CheckSlo, [switch]$CheckTracing)
 
 $ErrorActionPreference = 'Stop'
+if ($CheckTracing) { $CheckSlo = $true }
 if ($CheckSlo) { $CheckAlerting = $true }
 if ($CheckAlerting) {
     $CheckMonitoring = $true
@@ -12,7 +13,9 @@ $project = 'fleet-lab8-check-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $composeArgs = @('--profile', 'lab7', '-f', 'compose.yaml', '-f', 'tests/lab4.compose.yaml', '-p', $project)
 if ($CheckMonitoring) { $composeArgs = @('--profile', 'monitoring') + $composeArgs }
 $oldPassword = $env:MSSQL_SA_PASSWORD
+$oldTraceEndpoint = $env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
 $env:MSSQL_SA_PASSWORD = 'Lab8!' + [guid]::NewGuid().ToString('N')
+if ($CheckTracing) { $env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'http://jaeger:4318/v1/traces' }
 if ($CheckAlerting) {
     New-Item -ItemType Directory -Path TestResults -Force | Out-Null
     $alertEvidence = Join-Path TestResults "$project-alerts.jsonl"
@@ -30,6 +33,46 @@ function Wait-For($description, [scriptblock]$check, [int]$attempts = 45) {
         Start-Sleep -Seconds 1
     }
     throw "Timed out waiting for $description"
+}
+
+function New-TraceRequest {
+    $traceId = [guid]::NewGuid().ToString('N')
+    $parentId = [guid]::NewGuid().ToString('N').Substring(0, 16)
+    @{ Id = $traceId; Parent = $parentId; Headers = @{ traceparent = "00-$traceId-$parentId-01" } }
+}
+
+function Assert-CommandTrace($request, [int]$status, $payload) {
+    Wait-For "Jaeger trace $($request.Id)" {
+        $response = Invoke-WebRequest "$jaegerUrl/api/traces/$($request.Id)" -SkipHttpErrorCheck -TimeoutSec 5
+        $response.StatusCode -eq 200 -and @(($response.Content | ConvertFrom-Json).data[0].spans).Count -ge 3
+    }
+    $raw = (Invoke-WebRequest "$jaegerUrl/api/traces/$($request.Id)" -TimeoutSec 5).Content
+    $trace = ($raw | ConvertFrom-Json).data[0]
+    if ($raw.Contains($payload) -or $raw.Contains($env:MSSQL_SA_PASSWORD)) {
+        throw 'Sensitive data appeared in trace'
+    }
+    Set-Content (Join-Path TestResults "$project-trace-$status.json") $raw
+    $server = @($trace.spans | Where-Object { $_.tags | Where-Object { $_.key -eq 'span.kind' -and $_.value -eq 'server' } })
+    $sql = @($trace.spans | Where-Object operationName -eq 'INSERT Messages')
+    $kafka = @($trace.spans | Where-Object operationName -eq 'publish robot.commands')
+    if ($trace.spans.Count -ne 3 -or $server.Count -ne 1 -or $sql.Count -ne 1 -or $kafka.Count -ne 1) {
+        throw 'Expected exactly one HTTP, SQL and Kafka span'
+    }
+    if ($server[0].references.spanID -ne $request.Parent -or
+        $sql[0].references.spanID -ne $server[0].spanID -or $kafka[0].references.spanID -ne $server[0].spanID -or
+        $trace.spans.Where({ $_.traceID -ne $request.Id -or $_.duration -le 0 }).Count -gt 0 -or
+        $trace.processes.($server[0].processID).serviceName -ne 'robotics-api' -or
+        ($server[0].tags | Where-Object key -eq 'http.response.status_code').value -ne $status) {
+        throw 'Unexpected span hierarchy, service or HTTP status'
+    }
+    $kafkaError = $kafka[0].tags | Where-Object { ($_.key -eq 'error' -and $_.value -eq $true) -or
+        ($_.key -eq 'otel.status_code' -and $_.value -eq 'ERROR') }
+    $exception = $kafka[0].logs.fields | Where-Object { $_.key -eq 'exception.type' -and $_.value -like 'Confluent.Kafka.*' }
+    if (($status -eq 503 -and (!$kafkaError -or !$exception)) -or ($status -eq 201 -and $kafkaError)) {
+        throw 'Unexpected Kafka error status or exception event'
+    }
+    Write-Host "PASS Jaeger trace $($request.Id) for POST $status"
+    $trace.spans | Select-Object operationName, spanID, duration | Format-Table | Out-Host
 }
 
 function Send-Receipt($id, $timestamp, $key = $id) {
@@ -156,6 +199,10 @@ try {
     Invoke-Compose up --build --wait api bridge simulator
     $apiUrl = "http://$(Invoke-Compose port api 8080)"
     $baseUrl = "$apiUrl/api/messages"
+    if ($CheckTracing) {
+        Invoke-Compose up --wait jaeger
+        $jaegerUrl = "http://$(Invoke-Compose port jaeger 16686)"
+    }
     if ($CheckMonitoring) {
         Invoke-Compose up --wait prometheus grafana kafka-exporter
         $promUrl = "http://$(Invoke-Compose port prometheus 9090)"
@@ -214,10 +261,25 @@ try {
         Assert-Health 'MSSQL restored while worker is still running' 200
     }
 
-    $post = Invoke-WebRequest $baseUrl -Method Post -ContentType application/json -Body '{"content":"Lab 8 receipt verification"}'
+    $postHeaders = @{}
+    if ($CheckTracing) {
+        $successTrace = New-TraceRequest
+        $postHeaders = $successTrace.Headers
+    }
+    $post = Invoke-WebRequest $baseUrl -Method Post -ContentType application/json -Body '{"content":"Lab 8 receipt verification"}' -Headers $postHeaders
     $id = ($post.Content | ConvertFrom-Json).messageId
     if ($post.StatusCode -ne 201 -or !$id) { throw 'POST did not create a message' }
     Write-Host "POST 201 $($post.Content)"
+    if ($CheckTracing) {
+        Assert-CommandTrace $successTrace 201 'Lab 8 receipt verification'
+        $commandRecord = Invoke-Compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:29092 --topic robot.commands --from-beginning --max-messages 1 --timeout-ms 15000 --property print.key=true
+        $commandKey, $commandValue = $commandRecord -split "`t", 2
+        $command = $commandValue | ConvertFrom-Json
+        if ($commandKey -cne $id -or $command.messageId -cne $id -or $command.type -cne 'PING') {
+            throw 'Kafka command did not match the traced POST'
+        }
+        Write-Host "PASS robot.commands key and value match POST messageId $id"
+    }
     Assert-Group 1 1 0
     $record = Invoke-Compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:29092 --topic robot.events --from-beginning --max-messages 1 --timeout-ms 15000 --property print.key=true
     $key, $value = $record -split "`t", 2
@@ -326,6 +388,13 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     if ($CheckHealth) {
         Invoke-Compose stop kafka
         Assert-Health 'Kafka unavailable' 503
+        if ($CheckTracing) {
+            $failureTrace = New-TraceRequest
+            $failedPost = Invoke-WebRequest $baseUrl -Method Post -ContentType application/json `
+                -Body '{"content":"Lab 13 Kafka outage verification"}' -Headers $failureTrace.Headers -SkipHttpErrorCheck
+            if ($failedPost.StatusCode -ne 503) { throw 'Expected POST 503 during Kafka outage' }
+            Assert-CommandTrace $failureTrace 503 'Lab 13 Kafka outage verification'
+        }
         Invoke-Compose up --wait kafka
         Assert-Health 'Kafka restored' 200
     }
@@ -389,5 +458,8 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
 }
 finally {
     try { Invoke-Compose down }
-    finally { $env:MSSQL_SA_PASSWORD = $oldPassword }
+    finally {
+        $env:MSSQL_SA_PASSWORD = $oldPassword
+        $env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = $oldTraceEndpoint
+    }
 }

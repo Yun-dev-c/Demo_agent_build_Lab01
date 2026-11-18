@@ -1,4 +1,8 @@
 services:
+  jaeger:
+    ports: !override
+      - target: 16686
+        host_ip: 127.0.0.1
   alertmanager:
     ports: !override
       - target: 9093
