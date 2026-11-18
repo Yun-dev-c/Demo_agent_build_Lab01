@@ -1,0 +1,420 @@
+{
+  "uid": "robotics-api-scrape-slo",
+  "title": "Robotics API Scrape SLO",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 9,
+      "type": "text",
+      "title": "How to read this dashboard",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "This SLO tracks the Prometheus scrape of `/metrics`. User-facing API availability and receipt processing have separate signals. Missing scrapes reduce coverage. During startup or collection gaps, treat the observed ratio and budget as provisional. All rolling windows are seven days, independent of the dashboard time picker."
+      }
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Current API metrics scrape",
+      "description": "Latest Prometheus scrape result for /metrics.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "robotics-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 6,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "noValue": "Unknown · no data",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Scrape failed",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "Scrape succeeded",
+                  "color": "green"
+                },
+                "-1": {
+                  "text": "Unknown · target missing",
+                  "color": "gray"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "robotics-prometheus"
+          },
+          "expr": "up{job=\"robotics-api\"} or on() vector(-1)",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "7-day coverage status",
+      "description": "Use the observed SLI and budget as provisional until the expected sample count is reached.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "robotics-prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 4,
+        "w": 6,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "noValue": "Unknown · no data",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Insufficient history",
+                  "color": "orange"
+                },
+                "1": {
+                  "text": "Expected sample count reached",
+                  "color": "green"
+                },
+                "-1": {
+                  "text": "Unknown · target or samples missing",
+                  "color": "gray"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "robotics-prometheus"
+          },
+          "expr": "((count_over_time(up{job=\"robotics-api\"}[7d]) and on(job, instance) up{job=\"robotics-api\"}) >= bool 120960) or on() vector(-1)",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Observed 7-day sample coverage",
+      "description": "Observed scrapes divided by 120,960 expected at the repository's five-second interval. Both successful and failed scrapes count toward coverage.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "robotics-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 6,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "Unknown · no data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "robotics-prometheus"
+          },
+          "expr": "(count_over_time(up{job=\"robotics-api\"}[7d]) and on(job, instance) up{job=\"robotics-api\"}) / 120960",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Scrape SLO target",
+      "description": "99% of scrapes over seven days.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "robotics-prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 4,
+        "w": 6,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "Unknown · no data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "robotics-prometheus"
+          },
+          "expr": "vector(0.99)",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Observed 7-day scrape success",
+      "description": "Provisional with incomplete coverage. Average of observed 0/1 scrape samples.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "robotics-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 6,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "Unknown · no data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "robotics-prometheus"
+          },
+          "expr": "(avg_over_time(up{job=\"robotics-api\"}[7d]) and on(job, instance) up{job=\"robotics-api\"})",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Observed error budget consumed",
+      "description": "Provisional with incomplete coverage. Values above 100% indicate an exceeded budget.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "robotics-prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 10,
+        "w": 6,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "Unknown · no data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "robotics-prometheus"
+          },
+          "expr": "(1 - (avg_over_time(up{job=\"robotics-api\"}[7d]) and on(job, instance) up{job=\"robotics-api\"})) / 0.01",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Observed error budget remaining",
+      "description": "Provisional with incomplete coverage. Negative values show how far the budget was exceeded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "robotics-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 6,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "Unknown · no data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "robotics-prometheus"
+          },
+          "expr": "1 - (1 - (avg_over_time(up{job=\"robotics-api\"}[7d]) and on(job, instance) up{job=\"robotics-api\"})) / 0.01",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Scrape success history",
+      "description": "Rolling seven-day success over samples observed at each point. Check coverage before interpreting the result.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "robotics-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 24,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "Unknown · no data",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "robotics-prometheus"
+          },
+          "expr": "(avg_over_time(up{job=\"robotics-api\"}[7d]) and on(job, instance) up{job=\"robotics-api\"})",
+          "instant": false,
+          "range": true
+        }
+      ]
+    }
+  ]
+}

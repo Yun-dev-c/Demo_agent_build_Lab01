@@ -1,8 +1,9 @@
 #Requires -Version 7.5
 # Run from the repository root.
-param([switch]$CheckHealth, [switch]$CheckMonitoring, [switch]$CheckAlerting)
+param([switch]$CheckHealth, [switch]$CheckMonitoring, [switch]$CheckAlerting, [switch]$CheckSlo)
 
 $ErrorActionPreference = 'Stop'
+if ($CheckSlo) { $CheckAlerting = $true }
 if ($CheckAlerting) {
     $CheckMonitoring = $true
     $CheckHealth = $true
@@ -92,6 +93,34 @@ function Save-AlertEvidence($scenario) {
     $evidence | ConvertTo-Json -Depth 20 -Compress | Add-Content -LiteralPath $alertEvidence
 }
 
+function Get-SloValues($scenario, [string]$queryTime = '') {
+    $values = [ordered]@{ scenario = $scenario; observedAt = [datetimeoffset]::UtcNow.ToString('o') }
+    foreach ($panel in $sloDashboard.panels | Where-Object targets) {
+        $query = [uri]::EscapeDataString($panel.targets[0].expr)
+        $queryUrl = "$promUrl/api/v1/query?query=$query"
+        if ($queryTime) { $queryUrl += "&time=$queryTime" }
+        $result = Invoke-RestMethod $queryUrl -TimeoutSec 5
+        if ($result.status -ne 'success' -or $result.data.result.Count -gt 1) {
+            throw "Unexpected Prometheus result for panel $($panel.id)"
+        }
+        $values["panel$($panel.id)"] = if ($result.data.result.Count -eq 1) {
+            [double]::Parse($result.data.result[0].value[1], [cultureinfo]::InvariantCulture)
+        }
+    }
+    if (!$queryTime) {
+        $historyQuery = [uri]::EscapeDataString(($sloDashboard.panels | Where-Object id -eq 8).targets[0].expr)
+        $end = [datetimeoffset]::UtcNow.ToUnixTimeSeconds()
+        $history = Invoke-RestMethod "$promUrl/api/v1/query_range?query=$historyQuery&start=$($end - 30)&end=$end&step=5" -TimeoutSec 5
+        if ($history.status -ne 'success' -or $history.data.result.Count -ne 1 -or
+            $history.data.result[0].values.Count -eq 0) { throw 'Scrape history query returned no samples' }
+        $values.history = $history.data.result[0].values
+    }
+    $json = $values | ConvertTo-Json -Compress -Depth 10
+    Add-Content -LiteralPath $sloEvidence -Value $json
+    Write-Host $json
+    return $values
+}
+
 function Wait-Alerts([string[]]$names, [switch]$Resolved, [string]$Signal) {
     $mode = if ($Resolved) { 'resolved' } else { 'firing and grouped' }
     function Select-Alerts($alerts) {
@@ -149,6 +178,22 @@ try {
                 $proxy.StatusCode -eq 200 -and ($proxy.Content | ConvertFrom-Json).data.result.Count -ge 2
         }
         Write-Host 'PASS Grafana provisioned dashboard and working Prometheus datasource'
+        if ($CheckSlo) {
+            $sloEvidence = Join-Path TestResults "$project-slo.jsonl"
+            Wait-For 'provisioned scrape SLO dashboard' {
+                $dashboard = Invoke-WebRequest "$grafanaUrl/api/dashboards/uid/robotics-api-scrape-slo" -SkipHttpErrorCheck -TimeoutSec 5
+                if ($dashboard.StatusCode -ne 200) { return $false }
+                $definition = $dashboard.Content | ConvertFrom-Json
+                return $definition.meta.provisioned -and @($definition.dashboard.panels | Where-Object targets).Count -eq 8
+            }
+            $sloDashboard = (Invoke-RestMethod "$grafanaUrl/api/dashboards/uid/robotics-api-scrape-slo").dashboard
+            $missing = Get-SloValues 'evaluation before any target or samples existed' '0'
+            if ($missing.panel1 -ne -1 -or $missing.panel2 -ne -1 -or $missing.panel4 -ne 0.99 -or
+                @('panel3', 'panel5', 'panel6', 'panel7', 'panel8' | Where-Object { $null -ne $missing[$_] }).Count) {
+                throw 'Missing history should report unknown and return no ratio or budget'
+            }
+            Write-Host 'PASS SLO dashboard provisioning and missing-data handling'
+        }
         Assert-Metric 'robotics_consumer_last_success_timestamp_seconds' { param($v) $v -eq '0' }
     }
     Wait-For 'both ROS topic pairs' {
@@ -231,9 +276,24 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
         if ($normal.state -contains 'firing') { throw 'Unexpected firing alerts under normal operation' }
         Save-AlertEvidence 'normal after hold periods'
         Write-Host 'PASS no unexpected alerts under normal operation'
+        if ($CheckSlo) {
+            $before = Get-SloValues 'healthy baseline'
+            if ($before.panel1 -ne 1 -or $before.panel2 -ne 0 -or $before.panel3 -le 0 -or
+                $before.panel3 -ge 1 -or $before.panel4 -ne 0.99 -or $before.panel5 -ne 1 -or
+                $before.panel6 -ne 0 -or $before.panel7 -ne 1) {
+                throw 'Unexpected baseline SLO or coverage'
+            }
+        }
 
         Invoke-Compose stop api
         Wait-Alerts 'RoboticsApiMetricsDown'
+        if ($CheckSlo) {
+            $outage = Get-SloValues 'API stopped'
+            if ($outage.panel1 -ne 0 -or $outage.panel2 -ne 0 -or $outage.panel5 -ge $before.panel5 -or
+                $outage.panel6 -le $before.panel6 -or $outage.panel7 -ge $before.panel7) {
+                throw 'API outage did not decrease the observed SLI and remaining budget'
+            }
+        }
         $httpResult = try {
             (Invoke-WebRequest "$apiUrl/health/live" -SkipHttpErrorCheck -TimeoutSec 3).StatusCode
         } catch {
@@ -253,6 +313,14 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
         Assert-Health 'API restored' 200
         Wait-Alerts 'RoboticsApiMetricsDown' -Resolved
         Save-AlertEvidence 'API scrape recovered'
+        if ($CheckSlo) {
+            $recovered = Get-SloValues 'API restarted'
+            if ($recovered.panel1 -ne 1 -or $recovered.panel2 -ne 0 -or
+                $recovered.panel5 -ge 1 -or $recovered.panel6 -le 0) {
+                throw 'Recovery did not retain failed scrape history'
+            }
+            Write-Host 'PASS SLO degraded during outage and retained failure history after recovery'
+        }
     }
 
     if ($CheckHealth) {

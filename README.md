@@ -318,3 +318,50 @@ Run the isolated failure and recovery exercise. It records raw alert snapshots, 
 ```powershell
 pwsh -NoProfile -File ./tests/lab8-receipts.ps1 -CheckAlerting
 ```
+
+## Lab 12 — API scrape SLO and error budget
+
+The [Robotics API Scrape SLO dashboard](http://127.0.0.1:3000/d/robotics-api-scrape-slo) is provisioned alongside the operations dashboard. Start the monitoring profile as shown in Lab 11. The objective is 99% successful Prometheus scrapes of the API's `/metrics` endpoint over a rolling seven days, with a 1% error budget. A successful scrape says Prometheus could collect metrics at that moment. User requests and receipt processing have separate signals.
+
+### PromQL
+
+The dashboard uses these expressions. All percentages are represented as fractions in Prometheus.
+
+```promql
+# Latest scrape result. The -1 sentinel means the target is missing.
+up{job="robotics-api"} or on() vector(-1)
+
+# Observed coverage and its status. 120960 is seven days at one scrape per five seconds.
+(count_over_time(up{job="robotics-api"}[7d]) and on(job, instance) up{job="robotics-api"}) / 120960
+((count_over_time(up{job="robotics-api"}[7d]) and on(job, instance) up{job="robotics-api"}) >= bool 120960) or on() vector(-1)
+
+# SLO target.
+vector(0.99)
+
+# Observed rolling SLI, also used as a range query for history.
+(avg_over_time(up{job="robotics-api"}[7d]) and on(job, instance) up{job="robotics-api"})
+
+# Observed budget consumed and remaining.
+(1 - (avg_over_time(up{job="robotics-api"}[7d]) and on(job, instance) up{job="robotics-api"})) / 0.01
+1 - (1 - (avg_over_time(up{job="robotics-api"}[7d]) and on(job, instance) up{job="robotics-api"})) / 0.01
+```
+
+An observed `up=0` counts as a failure. A missing sample contributes neither success nor failure and lowers coverage. The target match prevents old samples alone from producing a current SLI for a missing target. Coverage status shows **Insufficient history** until the expected count is reached. Until then, the observed ratio and budget are provisional, even if every recorded scrape succeeded. If the target or data is absent, the status is **Unknown** and there is no ratio or budget value. A Prometheus outage prevents live queries. After recovery, the missing collection period reduces coverage. Coverage is a sample-count estimate for this single-target, fixed-interval Compose setup. Short scheduling shifts near the window boundary can affect it. If the scrape interval changes, update the expected count. Budget consumption can exceed 100% and remaining budget can go below zero.
+
+### Verify degradation and recovery
+
+Use the isolated suite to provision both dashboards, check the exact dashboard PromQL, exercise a scrape outage, and rerun Lab 8–11 checks. It preserves volumes and saves evidence under `TestResults`.
+
+```powershell
+pwsh -NoProfile -File ./tests/lab8-receipts.ps1 -CheckSlo
+```
+
+For a manual exercise on a disposable development stack, open the SLO dashboard and wait for successful scrapes. Stop only the API and allow Prometheus to record several failed scrapes. Leave Prometheus running so the outage is observed.
+
+```powershell
+docker compose stop api
+Start-Sleep -Seconds 15
+docker compose up -d api
+```
+
+During the stop, scrape status changes to **Scrape failed**, observed success drops, and observed budget consumption rises. After restart, wait for **Scrape succeeded**. The rolling ratio and budget retain the recorded failures until they age out of the window.
