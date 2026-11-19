@@ -1,6 +1,7 @@
 #Requires -Version 7.5
 # Run from the repository root.
-param([switch]$CheckHealth, [switch]$CheckMonitoring, [switch]$CheckAlerting, [switch]$CheckSlo, [switch]$CheckTracing)
+param([switch]$CheckHealth, [switch]$CheckMonitoring, [switch]$CheckAlerting, [switch]$CheckSlo, [switch]$CheckTracing,
+    [scriptblock]$OnCheckpoint)
 
 $ErrorActionPreference = 'Stop'
 if ($CheckTracing) { $CheckSlo = $true }
@@ -25,6 +26,10 @@ if ($CheckAlerting) {
 function Invoke-Compose {
     docker compose @composeArgs @args
     if ($LASTEXITCODE -ne 0) { throw "Compose failed: $($args -join ' ')" }
+}
+
+function Complete-Checkpoint([string]$name) {
+    if ($OnCheckpoint) { & $OnCheckpoint $name $project }
 }
 
 function Wait-For($description, [scriptblock]$check, [int]$attempts = 45) {
@@ -191,6 +196,7 @@ function Wait-Alerts([string[]]$names, [switch]$Resolved, [string]$Signal) {
 
 try {
     Write-Host "Isolated Compose project $project"
+    if ($OnCheckpoint) { & $OnCheckpoint 'Starting' $project }
     Invoke-Compose up --wait kafka mssql
     Invoke-Compose run --build --rm migrations
     foreach ($topic in @('robot.commands', 'robot.events')) {
@@ -199,6 +205,7 @@ try {
     Invoke-Compose up --build --wait api bridge simulator
     $apiUrl = "http://$(Invoke-Compose port api 8080)"
     $baseUrl = "$apiUrl/api/messages"
+    Complete-Checkpoint 'Isolated stack and migrations'
     if ($CheckTracing) {
         Invoke-Compose up --wait jaeger
         $jaegerUrl = "http://$(Invoke-Compose port jaeger 16686)"
@@ -242,6 +249,7 @@ try {
             Write-Host 'PASS SLO dashboard provisioning and missing-data handling'
         }
         Assert-Metric 'robotics_consumer_last_success_timestamp_seconds' { param($v) $v -eq '0' }
+        Complete-Checkpoint 'Monitoring and dashboard provisioning'
     }
     Wait-For 'both ROS topic pairs' {
         $commands = Invoke-Compose exec -T bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic info /demo/commands --verbose --no-daemon'
@@ -259,6 +267,7 @@ try {
         Assert-Health 'MSSQL unavailable while worker is idle' 503
         Invoke-Compose up --wait mssql
         Assert-Health 'MSSQL restored while worker is still running' 200
+        Complete-Checkpoint 'Idle consumer and SQL availability health checks'
     }
 
     $postHeaders = @{}
@@ -295,6 +304,7 @@ try {
     Write-Host "GET 200 $($get | ConvertTo-Json -Compress)"
     Invoke-Compose logs --no-color bridge simulator api | Select-String -SimpleMatch $id | Out-Host
     Write-Host 'PASS HTTP to ROS to Kafka to SQL and GET'
+    Complete-Checkpoint 'Command receipt round trip and successful trace'
     if ($CheckMonitoring) {
         $metrics = (Invoke-WebRequest "$apiUrl/metrics").Content
         if ($metrics -notmatch 'robotics_receipts_processed_total' -or
@@ -331,6 +341,7 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
         $lagQuery = 'kafka_consumergroup_lag{consumergroup="robotics-fleet-receipts",topic="robot.events",partition="0"}'
         Assert-Metric $lagQuery { param($v) $v -eq '0' }
     }
+    Complete-Checkpoint 'Duplicate unmatched receipts and metrics'
     if ($CheckAlerting) {
         # Wait past the longest hold time with all required series present.
         Start-Sleep -Seconds 65
@@ -383,6 +394,7 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
             }
             Write-Host 'PASS SLO degraded during outage and retained failure history after recovery'
         }
+        Complete-Checkpoint 'API scrape alert and SLO degradation recovery'
     }
 
     if ($CheckHealth) {
@@ -397,6 +409,7 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
         }
         Invoke-Compose up --wait kafka
         Assert-Health 'Kafka restored' 200
+        Complete-Checkpoint 'Kafka outage health and failed trace'
     }
 
     Invoke-Compose stop mssql
@@ -407,6 +420,8 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     }
     Assert-Group 3 5 2
     Write-Host 'PASS SQL failure left the failed and subsequent offsets uncommitted'
+    if ($CheckHealth) { Assert-Health 'SQL outage with faulted consumer' 503 }
+    Complete-Checkpoint 'SQL outage and uncommitted receipt offsets'
     if ($CheckMonitoring) {
         Assert-Metric 'robotics_receipts_failures_total{reason="database_error"}' { param($v) $v -eq '1' }
         if (!$CheckAlerting) {
@@ -432,8 +447,20 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     if ($CheckMonitoring) { Assert-Metric $lagQuery { param($v) $v -eq '0' } }
     if ($CheckHealth) {
         $apiUrl = "http://$(Invoke-Compose port api 8080)"
+        $baseUrl = "$apiUrl/api/messages"
         Assert-Health 'API restarted after SQL failure' 200
     }
+    $finalGet = Invoke-WebRequest "$baseUrl/$id"
+    $finalMessage = $finalGet.Content | ConvertFrom-Json -DateKind String
+    $finalUnmatched = Invoke-WebRequest "$baseUrl/$unknown" -SkipHttpErrorCheck
+    if ($finalGet.StatusCode -ne 200 -or $finalMessage.messageId -cne $id -or
+        $finalMessage.status -cne 'Acknowledged' -or
+        [datetimeoffset]$finalMessage.receivedAt -ne [datetimeoffset]$receipt.receivedAt -or
+        $finalUnmatched.StatusCode -ne 404) {
+        throw 'Receipt state inconsistent after SQL recovery and consumer restart'
+    }
+    Write-Host 'PASS recovered receipt remains Acknowledged with original timestamp and unmatched returns 404'
+    Complete-Checkpoint 'SQL recovery consumer restart and final receipt state'
     if ($CheckAlerting) {
         Wait-Alerts @('RoboticsReceiptLagHigh', 'RoboticsReceiptConsumerUnavailable') -Resolved
         Save-AlertEvidence 'consumer restarted and lag cleared'
@@ -443,6 +470,7 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
         Invoke-Compose up --wait kafka-exporter
         Wait-Alerts 'RoboticsTelemetryMissing' -Signal receipt-lag -Resolved
         Save-AlertEvidence 'Kafka exporter recovered'
+        Complete-Checkpoint 'Consumer alerts and missing exporter recovery'
     }
 
     Send-Receipt $id $receipt.receivedAt $unknown
@@ -455,9 +483,13 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
         Assert-Metric 'robotics_receipts_failures_total{reason="invalid_receipt"}' { param($v) $v -eq '1' }
     }
     if ($CheckHealth) { Assert-Health 'fatal malformed receipt with healthy dependencies' 503 }
+    Complete-Checkpoint 'Malformed receipt health and offset protection'
 }
 finally {
-    try { Invoke-Compose down }
+    try {
+        Invoke-Compose down
+        Complete-Checkpoint 'Isolated cleanup preserving volumes'
+    }
     finally {
         $env:MSSQL_SA_PASSWORD = $oldPassword
         $env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = $oldTraceEndpoint

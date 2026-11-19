@@ -393,3 +393,19 @@ Invoke-WebRequest http://127.0.0.1:8080/api/messages -Method Post `
 Allow a few seconds for batching before opening the printed URL. You can also search for service `robotics-api` in Jaeger. In a disposable stack, stop Kafka with `docker compose stop kafka`, rerun the request with fresh trace and parent IDs, and include `-SkipHttpErrorCheck` on `Invoke-WebRequest` to inspect the 503 response. Expand `publish robot.commands` in Jaeger to inspect its Error status and `exception.type` event. The SQL span should show that persistence completed. Restore the broker with `docker compose up --wait kafka`. The failed publication can leave a Pending row, as in the existing command flow.
 
 Traces use in-memory Jaeger storage and disappear when Jaeger restarts. The application spans include operation names, outcomes and exception types. Payloads, SQL connection details, exception messages and stack traces are excluded. The trace ends at the producer delivery result. Kafka consumers, Python Bridge, ROS2 and receipt processing have no trace propagation in this lab.
+
+## Lab 14 — Automated acceptance and recovery
+
+Run the unified workflow with PowerShell 7.5 or later and Docker Desktop using Linux containers. Docker Compose must support `!override` and `!reset`. Image downloads and builds require registry access and sufficient Docker resources for the full stack. A host .NET SDK is optional because compilation and migrations run in containers.
+
+```powershell
+pwsh -NoProfile -File C:\Dev\Demo_Project\tests\lab14-acceptance.ps1
+```
+
+The entry point reuses `lab8-receipts.ps1 -CheckTracing` once, including its health, monitoring, alerting and SLO checks. Acceptance requires the complete command and receipt round trip, matching Kafka and HTTP identifiers, persisted Acknowledged status, duplicate and unmatched receipt handling, health checks, provisioned dashboards, alert firing and resolution, SLO degradation and recovery, and successful and failed Jaeger traces.
+
+SQL fault injection verifies live HTTP 200 and ready HTTP 503, the failed receipt and subsequent offset remaining uncommitted, and backlog processing after SQL recovery and an API restart. SQL restoration alone leaves the faulted consumer unavailable. The final GET must retain Acknowledged and the original receipt timestamp, with the unmatched ID still returning 404. The suite also exercises Kafka outages, exporter outages and malformed receipts.
+
+Each run uses the existing unique Compose project and dynamic loopback ports. Cleanup removes that run's containers and network while retaining named volumes. The workflow returns 0 only after all required checkpoints and cleanup succeed. A failure returns a nonzero exit code and identifies the source location in the report. Console output supplies live command diagnostics. Raw exception bodies and console transcripts are excluded from generated summaries to avoid persisting sensitive data.
+
+Read `TestResults/lab14/summary.json` and `TestResults/lab14/report.md` for the latest outcome. Each invocation also retains both files under a unique timestamped directory in `TestResults/lab14`. Results include PASS, FAIL or SKIP, UTC timestamps, durations, diagnostics and paths to the existing alert, SLO and trace evidence. Durations cover intervals between completed checkpoints. Subsequent checks blocked by an earlier failure are SKIP. `TestResults/` is Git ignored. Alert hold periods make this a multi-minute acceptance run.
