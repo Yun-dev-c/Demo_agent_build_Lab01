@@ -7,10 +7,16 @@ $runId = $startedAt.ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().To
 $resultsRoot = Join-Path $repository 'TestResults/lab14'
 $runDirectory = Join-Path $resultsRoot $runId
 New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
+# Prevent an earlier local run from supplying a stale success report.
+foreach ($name in @('summary.json', 'report.md', 'compose-project.txt')) {
+    $previous = Join-Path $resultsRoot $name
+    if (Test-Path -LiteralPath $previous) { Remove-Item -LiteralPath $previous }
+}
 $state = @{
     StartedAt = $startedAt
     Project = $null
     Checks = [System.Collections.Generic.List[object]]::new()
+    ResultsRoot = $resultsRoot
 }
 $expected = @(
     'Isolated stack and migrations'
@@ -29,7 +35,10 @@ $expected = @(
 $onCheckpoint = {
     param([string]$name, [string]$project)
     $state.Project = $project
-    if ($name -eq 'Starting') { return }
+    if ($name -eq 'Starting') {
+        Set-Content -LiteralPath (Join-Path $state.ResultsRoot 'compose-project.txt') -Value $project -Encoding utf8
+        return
+    }
     $now = [datetimeoffset]::UtcNow
     $state.Checks.Add([ordered]@{
         name = $name
@@ -80,6 +89,17 @@ if ($state.Project) {
     $evidence = @(Get-ChildItem -LiteralPath (Join-Path $repository 'TestResults') -File |
         Where-Object { $_.Name.StartsWith($state.Project + '-', [StringComparison]::Ordinal) } |
         ForEach-Object { $_.FullName })
+}
+if ($exitCode -eq 0) {
+    $requiredEvidence = @("$($state.Project)-alerts.jsonl", "$($state.Project)-slo.jsonl",
+        "$($state.Project)-trace-201.json", "$($state.Project)-trace-503.json")
+    foreach ($name in $requiredEvidence) {
+        $path = Join-Path $repository "TestResults/$name"
+        if (!(Test-Path -LiteralPath $path) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+            $failure = 'Required acceptance evidence is missing or empty.'
+            $exitCode = 1
+        }
+    }
 }
 $summary = [ordered]@{
     name = 'Lab 14 complete system acceptance and recovery'

@@ -409,3 +409,21 @@ SQL fault injection verifies live HTTP 200 and ready HTTP 503, the failed receip
 Each run uses the existing unique Compose project and dynamic loopback ports. Cleanup removes that run's containers and network while retaining named volumes. The workflow returns 0 only after all required checkpoints and cleanup succeed. A failure returns a nonzero exit code and identifies the source location in the report. Console output supplies live command diagnostics. Raw exception bodies and console transcripts are excluded from generated summaries to avoid persisting sensitive data.
 
 Read `TestResults/lab14/summary.json` and `TestResults/lab14/report.md` for the latest outcome. Each invocation also retains both files under a unique timestamped directory in `TestResults/lab14`. Results include PASS, FAIL or SKIP, UTC timestamps, durations, diagnostics and paths to the existing alert, SLO and trace evidence. Durations cover intervals between completed checkpoints. Subsequent checks blocked by an earlier failure are SKIP. `TestResults/` is Git ignored. Alert hold periods make this a multi-minute acceptance run.
+
+## Lab 15 — GitHub Actions acceptance
+
+`.github/workflows/lab15-ci.yml` runs the existing Lab 14 suite on push, pull request and manual dispatch. The single **Full system acceptance** job uses GitHub-hosted `ubuntu-24.04`, read-only repository permission, temporary test credentials and a 45-minute timeout. It verifies PowerShell 7.5+, Docker Linux containers and Compose support for the test override before building and running the suite.
+
+Run the same acceptance entry point locally from the checkout root.
+
+```powershell
+pwsh -NoProfile -File ./tests/lab14-acceptance.ps1
+```
+
+The workflow validates the actual reports and four required evidence files. Missing prerequisites, failed tests, absent reports and incomplete evidence fail the job. Cleanup and artifact upload are attempted after success and failure. The suite records its generated Compose project in `TestResults/lab14/compose-project.txt` so CI can retry cleanup for that project after interruption. Named volumes are retained, and hosted runners are discarded after the job.
+
+Download `lab15-acceptance-<run_id>-<run_attempt>` from the Actions run. Artifacts retain the Lab 14 summary/report, preflight outcome, alert/SLO snapshots and successful/failed traces for seven days. Raw console transcripts and service logs are excluded. The Actions step log preserves command diagnostics. A report-validation failure or artifact-upload failure cannot turn an earlier acceptance failure into success.
+
+After an observed run and administrator approval, require the GitHub Actions check **Full system acceptance** for `main` through a ruleset or branch protection. Verify its exact displayed name and prove that a failing disposable PR is blocked from merging. Follow [Lab 15 human acceptance](acceptance/lab15-uat.md) for triggers, negative tests, restoration and the pending result record. Repository rules require manual configuration.
+
+The scripts use portable PowerShell paths and containerized tools. The README's Windows checkout path is a local example. Actual Linux execution, runner capacity and merge blocking remain pending until verified. Standard runner resources vary by repository visibility and plan. Cold builds and this multi-service stack may exhaust memory or disk; the workflow reports resources and preserves the original failure. Image/package network access and ROS2 DDS discovery are also required. See [GitHub-hosted runner specifications](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).

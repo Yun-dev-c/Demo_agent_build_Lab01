@@ -1,0 +1,109 @@
+name: Lab 15 Acceptance
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    name: Full system acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify prerequisites and Compose
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path TestResults/lab15 -Force | Out-Null
+          try {
+            if ($PSVersionTable.PSVersion -lt [version]'7.5') { throw 'PowerShell 7.5 or later is required.' }
+            Get-Command docker -ErrorAction Stop | Out-Null
+            docker version
+            if ($LASTEXITCODE -ne 0) { throw 'Docker daemon is unavailable.' }
+            docker compose version
+            if ($LASTEXITCODE -ne 0) { throw 'Docker Compose is unavailable.' }
+            if ((docker info --format '{{.OSType}}') -ne 'linux' -or $LASTEXITCODE -ne 0) {
+              throw 'Linux Docker containers are required.'
+            }
+            $password = 'Lab15!' + [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(24))
+            Write-Host "::add-mask::$password"
+            $env:MSSQL_SA_PASSWORD = $password
+            "MSSQL_SA_PASSWORD=$password" | Add-Content -LiteralPath $env:GITHUB_ENV
+            docker compose --profile lab7 --profile monitoring -f compose.yaml -f tests/lab4.compose.yaml config --quiet
+            if ($LASTEXITCODE -ne 0) { throw 'Compose configuration validation failed.' }
+            docker info --format 'CPUs={{.NCPU}} MemoryBytes={{.MemTotal}}'
+            if ($LASTEXITCODE -ne 0) { throw 'Docker resource inspection failed.' }
+            Get-PSDrive -Name / | Select-Object Used, Free | Format-Table
+            'PASS prerequisites and Compose validation' | Set-Content TestResults/lab15/preflight.txt
+          } catch {
+            'FAIL prerequisites or Compose validation. Inspect the workflow step log.' | Set-Content TestResults/lab15/preflight.txt
+            throw
+          }
+
+      - name: Run Lab 14 acceptance
+        run: pwsh -NoProfile -File ./tests/lab14-acceptance.ps1
+
+      - name: Validate acceptance reports
+        if: ${{ always() }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @('TestResults/lab14/summary.json', 'TestResults/lab14/report.md')) {
+            if (!(Test-Path -LiteralPath $path) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+              throw "Missing required acceptance report $path"
+            }
+          }
+          $summary = Get-Content TestResults/lab14/summary.json -Raw | ConvertFrom-Json
+          if ($summary.status -ne 'PASS' -or $summary.checks.Count -ne 12 -or
+              @($summary.checks | Where-Object status -ne 'PASS').Count -gt 0) {
+            throw 'Mandatory acceptance checks did not all pass.'
+          }
+          $project = $summary.composeProject
+          if ($project -cnotmatch '^fleet-lab8-check-[0-9a-f]{8}$') { throw 'Unexpected acceptance project name.' }
+          foreach ($suffix in @('alerts.jsonl', 'slo.jsonl', 'trace-201.json', 'trace-503.json')) {
+            $path = "TestResults/$project-$suffix"
+            if (!(Test-Path -LiteralPath $path) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+              throw "Missing required acceptance evidence $path"
+            }
+          }
+          Get-Content TestResults/lab14/report.md | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
+      - name: Clean up owned acceptance containers
+        if: ${{ always() }}
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $marker = 'TestResults/lab14/compose-project.txt'
+          if (Test-Path -LiteralPath $marker) {
+            $project = (Get-Content -LiteralPath $marker -Raw).Trim()
+            if ($project -cnotmatch '^fleet-lab8-check-[0-9a-f]{8}$') { throw 'Refusing unexpected cleanup project.' }
+            if (!$env:MSSQL_SA_PASSWORD) { $env:MSSQL_SA_PASSWORD = 'CleanupOnly!' + [guid]::NewGuid().ToString('N') }
+            docker compose --profile lab7 --profile monitoring -f compose.yaml -f tests/lab4.compose.yaml -p $project down --timeout 10
+            if ($LASTEXITCODE -ne 0) { throw 'Scoped acceptance cleanup failed.' }
+          }
+
+      - name: Upload acceptance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: lab15-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            TestResults/lab15/preflight.txt
+            TestResults/lab14/summary.json
+            TestResults/lab14/report.md
+            TestResults/fleet-lab8-check-*-alerts.jsonl
+            TestResults/fleet-lab8-check-*-slo.jsonl
+            TestResults/fleet-lab8-check-*-trace-201.json
+            TestResults/fleet-lab8-check-*-trace-503.json

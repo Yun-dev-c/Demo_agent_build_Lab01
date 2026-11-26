@@ -16,6 +16,7 @@ if ($CheckMonitoring) { $composeArgs = @('--profile', 'monitoring') + $composeAr
 $oldPassword = $env:MSSQL_SA_PASSWORD
 $oldTraceEndpoint = $env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
 $env:MSSQL_SA_PASSWORD = 'Lab8!' + [guid]::NewGuid().ToString('N')
+if ($env:GITHUB_ACTIONS -eq 'true') { Write-Host "::add-mask::$env:MSSQL_SA_PASSWORD" }
 if ($CheckTracing) { $env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'http://jaeger:4318/v1/traces' }
 if ($CheckAlerting) {
     New-Item -ItemType Directory -Path TestResults -Force | Out-Null
@@ -194,6 +195,7 @@ function Wait-Alerts([string[]]$names, [switch]$Resolved, [string]$Signal) {
     Write-Host "PASS alerts $($names -join ', ') $mode"
 }
 
+$suiteFailure = $null
 try {
     Write-Host "Isolated Compose project $project"
     if ($OnCheckpoint) { & $OnCheckpoint 'Starting' $project }
@@ -485,10 +487,18 @@ SELECT MessageId, Status, ReceivedAt FROM dbo.Messages WHERE MessageId = @id;
     if ($CheckHealth) { Assert-Health 'fatal malformed receipt with healthy dependencies' 503 }
     Complete-Checkpoint 'Malformed receipt health and offset protection'
 }
+catch {
+    $suiteFailure = $_
+    throw
+}
 finally {
     try {
         Invoke-Compose down
         Complete-Checkpoint 'Isolated cleanup preserving volumes'
+    }
+    catch {
+        if ($null -eq $suiteFailure) { throw }
+        Write-Warning 'Scoped cleanup also failed. The original acceptance error is preserved.'
     }
     finally {
         $env:MSSQL_SA_PASSWORD = $oldPassword
