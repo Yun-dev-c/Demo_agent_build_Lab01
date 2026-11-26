@@ -21,6 +21,7 @@ $state = @{
 $expected = @(
     'Isolated stack and migrations'
     'Monitoring and dashboard provisioning'
+    'ROS2 topic endpoint discovery'
     'Idle consumer and SQL availability health checks'
     'Command receipt round trip and successful trace'
     'Duplicate unmatched receipts and metrics'

@@ -21,7 +21,11 @@ if ($acceptanceExit -ne 0) { throw "Acceptance failed with exit $acceptanceExit"
 git diff --check
 ```
 
-Expected acceptance exit code is 0 with twelve PASS checkpoints and four nonempty alert/SLO/trace evidence files. A missing prerequisite must produce a nonzero exit code. Keep outputs under Git-ignored `TestResults`.
+Expected acceptance exit code is 0 with thirteen PASS checkpoints and four nonempty alert/SLO/trace evidence files. A missing prerequisite must produce a nonzero exit code. Keep outputs under Git-ignored `TestResults`.
+
+ROS2 endpoint discovery has its own required checkpoint before SQL health checks. Run its deterministic probe tests with `pwsh -NoProfile -File ./tests/ros2-discovery-checks.ps1`. These tests simulate immediate discovery, initially unknown topics, exhausted discovery, incomplete endpoints, unavailable Bridge/Simulator, CLI errors and probe timeouts. They exercise the actual retry and evidence code without creating Docker resources. The complete Lab 14 run remains required for real DDS verification.
+
+Discovery allows at most 45 attempts and 90 seconds, with a one-second polling delay. Each ROS CLI execution is bounded by container `timeout` and a host process deadline. Only exact unknown-topic responses, incomplete endpoint listings and probe timeouts are retried. Missing/stopped/unhealthy containers, failed container-status queries and other CLI errors fail immediately. Terminal failure still fails acceptance and collects container status plus the last 60 Bridge/Simulator log lines before cleanup. Diagnostic commands have separate five-second limits. Inspect `<project>-ros2-discovery.jsonl` for sanitized stdout, stderr, exit codes, attempt numbers and elapsed time. Presence of both expected node names on both topics remains mandatory.
 
 ## Trigger and inspect CI
 
@@ -31,7 +35,7 @@ The single job is **Full system acceptance** on `ubuntu-24.04`, with a 45-minute
 
 Prerequisite or required-test failures must make the job fail. Report validation runs even after a failed acceptance step and rejects absent/empty reports, a failed or incomplete checkpoint set, or missing evidence. Upload and cleanup use `always()` and do not convert earlier failures to success.
 
-Download `lab15-acceptance-<run_id>-<run_attempt>` from the workflow run's **Artifacts** section within seven days. Inspect `lab14/summary.json`, `lab14/report.md`, `lab15/preflight.txt`, and the project-specific alert JSONL, SLO JSONL and both Jaeger trace JSON files. The upload uses `TestResults` as its common root. Paths inside reports describe the runner checkout. Match filenames in the downloaded archive. Failed runs can have partial evidence. Inspect the original failed step in the Actions log for command details. Artifacts intentionally exclude `.env`, Docker inspection output, raw service logs and console transcripts.
+Download `lab15-acceptance-<run_id>-<run_attempt>` from the workflow run's **Artifacts** section within seven days. Inspect `lab14/summary.json`, `lab14/report.md`, `lab15/preflight.txt`, and the project-specific alert JSONL, SLO JSONL, both Jaeger trace JSON files and ROS2 discovery JSONL. The upload uses `TestResults` as its common root. Paths inside reports describe the runner checkout. Match filenames in the downloaded archive. Failed runs can have partial evidence. Inspect the original failed step in the Actions log for command details. Artifacts exclude `.env`, full Docker inspection output and console transcripts. Discovery evidence includes only sanitized bounded service-log excerpts.
 
 ## Controlled negative case and restoration
 
@@ -40,7 +44,7 @@ Use a disposable branch and pull request, with human approval for any commit/pus
 1. Run Lab 14 locally. Expect a timeout waiting for the impossible lag, a nonzero exit code, a FAIL summary, and subsequent SKIP checks. Cleanup should still run.
 2. Push the disposable branch after review and inspect its PR workflow. Confirm **Run Lab 14 acceptance** fails, **Validate acceptance reports** rejects the failed summary, and artifact upload is attempted. Record both the original failure and the final job conclusion.
 3. Download artifacts. Confirm diagnostics identify the failed test location, partial results are retained, and generated test credentials are absent. For the independent missing-report gate, download a successful run's artifacts into `TestResults` inside a temporary directory, remove only that copy's `TestResults/lab14/report.md`, and execute the **Validate acceptance reports** PowerShell block from the workflow in that temporary directory using a new `pwsh -NoProfile -File` process. Expect an exception and a nonzero process exit. This checks the report gate without changing acceptance execution.
-4. Restore the assertion to `Assert-Group 3 5 2`, inspect `git diff`, and rerun the same PR workflow after an authorized update. Expect all twelve checkpoints and the job to pass. Close the disposable PR after recording results.
+4. Restore the assertion to `Assert-Group 3 5 2`, inspect `git diff`, and rerun the same PR workflow after an authorized update. Expect all thirteen checkpoints and the job to pass. Close the disposable PR after recording results.
 
 To inspect retained test resources, obtain `composeProject` from the summary or read `TestResults/lab14/compose-project.txt`. Both identify the same generated project. The suite normally removes its containers and network in `finally`; CI also attempts cleanup from the startup marker if the suite was interrupted. On a local host, restore any required test-only password environment variable and use the exact project value with the command below only if its containers remain.
 
@@ -64,7 +68,8 @@ On the disposable failing PR, confirm the required check is red and merging is b
 
 | Case | Expected result | Actual result | Evidence | PASS / FAIL / BLOCKED |
 |---|---|---|---|---|
-| Local full acceptance | Exit 0, twelve PASS checks | PENDING | PENDING | PENDING |
+| Local full acceptance | Exit 0, thirteen PASS checks | PENDING | PENDING | PENDING |
+| ROS2 discovery probes | Bounded retries, permanent failures stop, sanitized evidence | PENDING | Probe test and hosted evidence pending | PENDING |
 | Hosted Ubuntu full acceptance | Successful job | PENDING | Run URL pending | PENDING |
 | Artifact contents | Reports and four evidence files, no credentials | PENDING | Artifact pending | PENDING |
 | Controlled required-test failure | Nonzero exit, failed job, partial evidence | PENDING | Run URL pending | PENDING |

@@ -4,6 +4,7 @@ param([switch]$CheckHealth, [switch]$CheckMonitoring, [switch]$CheckAlerting, [s
     [scriptblock]$OnCheckpoint)
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'ros2-discovery.ps1')
 if ($CheckTracing) { $CheckSlo = $true }
 if ($CheckSlo) { $CheckAlerting = $true }
 if ($CheckAlerting) {
@@ -253,14 +254,8 @@ try {
         Assert-Metric 'robotics_consumer_last_success_timestamp_seconds' { param($v) $v -eq '0' }
         Complete-Checkpoint 'Monitoring and dashboard provisioning'
     }
-    Wait-For 'both ROS topic pairs' {
-        $commands = Invoke-Compose exec -T bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic info /demo/commands --verbose --no-daemon'
-        $receipts = Invoke-Compose exec -T bridge bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic info /demo/receipts --verbose --no-daemon'
-        return ($commands -match 'Node name: robotics_fleet_bridge') -and
-            ($commands -match 'Node name: robotics_fleet_simulator') -and
-            ($receipts -match 'Node name: robotics_fleet_bridge') -and
-            ($receipts -match 'Node name: robotics_fleet_simulator')
-    }
+    Wait-Ros2Discovery -ComposeArguments $composeArgs -EvidencePath "TestResults/$project-ros2-discovery.jsonl"
+    Complete-Checkpoint 'ROS2 topic endpoint discovery'
     if ($CheckHealth) {
         Assert-Health 'normal operation' 200
         Start-Sleep -Seconds 12
